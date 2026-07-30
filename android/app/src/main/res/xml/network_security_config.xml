@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Development/MVP only: permits HTTP to a trusted private LAN receiver. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
