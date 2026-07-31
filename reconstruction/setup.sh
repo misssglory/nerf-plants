@@ -11,6 +11,8 @@ if ! command -v pixi >/dev/null 2>&1; then
 fi
 
 printf '\nInstalling the pinned Pixi environment...\n'
+# The manifest pins protobuf 3.20.3 and TensorBoard 2.14.1 because
+# Nerfstudio 1.1.5 is incompatible with protobuf 6.x.
 pixi install
 
 printf '\nChecking binary and Python runtimes...\n'
@@ -42,9 +44,10 @@ else
   cat <<'MSG'
 
 WARNING: CUDA is unavailable.
-Video extraction and COLMAP preprocessing are ready, but the included
-Nerfacto/Splatfacto training scripts are CUDA-oriented and are not expected to
-train practically on this machine. This is normal on an AMD Radeon 780M.
+Video extraction and COLMAP preprocessing are ready. Nerfacto can run through
+the CPU compatibility path with validation early stopping, but it will be much
+slower than CUDA training and does not use the Radeon 780M iGPU. Splatfacto
+still requires CUDA in this pinned environment.
 MSG
 fi
 
@@ -55,6 +58,6 @@ Plant Capture reconstruction environment is ready.
 Process a capture:
   ./process-video.sh ../captures/plant.mp4 plant_001 120
 
-CUDA machine only — train a mesh-capable model:
+Train a mesh-capable model with validation early stopping:
   ./train.sh plant_001 nerfacto
 MSG

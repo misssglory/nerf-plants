@@ -52,3 +52,25 @@ except ImportError:
     print("tiny-cuda-nn: missing (nerfacto will not use its fast CUDA backend)")
 else:
     print("tiny-cuda-nn: available")
+
+try:
+    import google.protobuf
+except ImportError as exc:
+    raise SystemExit(f"protobuf import failed: {exc}") from exc
+
+protobuf_version = google.protobuf.__version__
+print("protobuf:", protobuf_version)
+if protobuf_version != "3.20.3":
+    raise SystemExit(
+        "expected protobuf 3.20.3 for Nerfstudio 1.1.5, got "
+        f"{protobuf_version}; remove pixi.lock and run pixi install"
+    )
+
+try:
+    import tensorboard
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator  # noqa: F401
+except ImportError as exc:
+    raise SystemExit(f"tensorboard event reader import failed: {exc}") from exc
+else:
+    print("tensorboard:", tensorboard.__version__)
+    print("tensorboard event reader: available")

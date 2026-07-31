@@ -217,3 +217,9 @@ still the default; it can also be entered explicitly with:
 ```bash
 nix develop .#android
 ```
+
+## Automatic Nerfstudio stopping
+
+The reconstruction `train.sh` now trains against held-out views until validation
+PSNR/LPIPS plateau. It prints loss and render-quality deltas, preserves the best
+checkpoint, and writes CSV/JSON statistics. See `reconstruction/README.md`.

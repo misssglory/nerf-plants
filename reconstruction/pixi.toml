@@ -20,9 +20,16 @@ ffmpeg = ">=6,<8"
 ninja = ">=1.10"
 cmake = ">=3.27"
 git = ">=2.40"
+# Nerfstudio 1.1.5 requires protobuf<=3.20.3 and excludes 3.20.0.
+# Pin it on the Conda side so Pixi cannot select a modern protobuf 6.x
+# package before resolving Nerfstudio's PyPI requirements.
+protobuf = "3.20.3.*"
 
 [pypi-dependencies]
 nerfstudio = "==1.1.5"
+# The early-stopping supervisor reads Nerfstudio event files. TensorBoard
+# 2.14.1 supports protobuf>=3.19.6, so it shares the exact 3.20.3 runtime.
+tensorboard = "==2.14.1"
 
 [tasks]
 check = "python verify_environment.py"

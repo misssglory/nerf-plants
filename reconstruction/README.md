@@ -124,3 +124,88 @@ the Radeon 780M iGPU. Splatfacto fails early without CUDA because the pinned
 Nerfstudio/gsplat stack is CUDA-oriented.
 
 Run `./check-accelerator.sh` to see what this Pixi PyTorch installation can use.
+
+
+## Protobuf and TensorBoard compatibility
+
+Nerfstudio 1.1.5 requires `protobuf<=3.20.3` and excludes 3.20.0. Modern
+TensorBoard packages may pull protobuf 6.x, which makes Pixi report an
+unsatisfiable Conda/PyPI solve before training starts. This project therefore
+pins the compatible pair explicitly:
+
+```text
+protobuf 3.20.3
+tensorboard 2.14.1
+```
+
+After applying this update to an existing checkout, discard the stale lock and
+recreate the environment once:
+
+```bash
+cd reconstruction
+rm -f pixi.lock
+pixi install
+pixi run python verify_environment.py
+```
+
+The verification output must report protobuf 3.20.3 before `train.sh` is run.
+
+## Validation early stopping
+
+`train.sh` enables early stopping by default. It reserves every eighth registered
+video frame for validation, runs a full held-out render every 500 steps, and
+stops after four consecutive validations without either:
+
+- a PSNR increase of at least 0.03 dB; or
+- an LPIPS decrease of at least 0.002.
+
+The first 1000 steps are a warm-up and never trigger stopping. A hard maximum
+still protects against an endless run: 10000 steps on CPU and 30000 on CUDA by
+default.
+
+```bash
+./train.sh plant_001 nerfacto
+```
+
+Typical report:
+
+```text
+[quality] step=   2500  train_loss=0.04210 Δ=-0.00120 (-2.77%)  eval_loss=0.05190 Δ=-0.00030 (-0.57%)
+          PSNR=24.3812 dB  SSIM=0.8124  LPIPS=0.17320  status=IMPROVED (PSNR +0.0812 dB)  patience=0/4
+```
+
+Training loss is printed for diagnosis, but stopping is based on held-out render
+quality. A falling training loss alone can mean overfitting.
+
+Results are written inside the run directory:
+
+```text
+outputs/plant_001/nerfacto/TIMESTAMP/
+├── early_stopping.csv
+├── early_stopping.json
+├── best_checkpoint/
+│   ├── best.ckpt
+│   ├── best.json
+│   └── config.yml
+└── nerfstudio_models/
+```
+
+Useful overrides:
+
+```bash
+# Require six stale validations instead of four.
+PLANT_EARLY_STOP_PATIENCE=6 ./train.sh plant_001 nerfacto
+
+# Evaluate less often when CPU full-image renders are too expensive.
+PLANT_EVAL_INTERVAL=1000 ./train.sh plant_001 nerfacto
+
+# Keep the browser viewer in addition to TensorBoard metrics.
+PLANT_TRAIN_VIS=viewer+tensorboard ./train.sh plant_001 nerfacto
+
+# Disable early stopping for a short fixed smoke test.
+PLANT_EARLY_STOP=0 PLANT_MAX_ITERATIONS=200 ./train.sh plant_001 nerfacto
+```
+
+After changing `pixi.toml`, run `pixi install` once. The supervisor uses the
+TensorBoard event reader to observe Nerfstudio's `Train Loss`, `Eval Loss`, and
+all-image PSNR/SSIM/LPIPS metrics while training is running.
