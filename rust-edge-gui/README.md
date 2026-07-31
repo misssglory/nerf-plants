@@ -1,47 +1,42 @@
-# Rust Multi-layer Edge Viewer
+# Rust Green Shape + Edge Composer
 
-Native `egui`/`eframe` application for interactively composing several colored Canny edge layers.
+A small native Rust + egui tool for interactively finding a closed green shape (for example a leaf), then layering additional colored edge detections on top of a dimmed original image.
 
 ## Features
 
-- Load an image from a CLI path, native file dialog, or drag-and-drop.
-- Side-by-side original and layered-edge previews.
-- Independent preview scaling for original and edge images (`0.1×` to `8×`).
-- Add and delete any number of edge layers.
-- Enable/disable each layer independently.
-- Separate Canny low/high thresholds and color for each layer.
-- Shared optional Gaussian pre-blur.
-- Black or white output background.
-- Alpha-aware color compositing when layer edges overlap.
-- Live recalculation while sliders are dragged, with an option to disable it.
-- Save the rendered layered edge image as PNG.
+- open image from CLI, file dialog, or drag-and-drop
+- black UI theme
+- original and overlay preview side by side
+- mouse-wheel zoom on the hovered preview
+- separate stored scale for original and overlay preview
+- dimmed original image underneath the overlay preview
+- locked **Layer 0** that finds the closed green shape around the weighted center of green pixels
+- hole detection inside the selected green shape
+- area statistics for the shape and its holes
+- multiple extra edge layers with separate thresholds, colors, and threshold reduction near the green shape
+- save the composite overlay as PNG
 
-## Run with Nix
+## Build and run
 
 ```bash
 nix develop
 cargo run --release -- /path/to/image.jpg
 ```
 
-Or start without an image:
+or without an image:
 
 ```bash
+nix develop
 cargo run --release
 ```
 
-## Controls
-
-- **Original / Edges scale**: each preview is scaled independently. `1×` fits large images to their column; values above `1×` can be explored with scrollbars.
-- **Pre-blur σ**: Gaussian blur applied once before all Canny layers.
-- **White background**: switches the edge composite from black to white.
-- **Add layer**: creates another independently configured Canny layer.
-- **Layer checkbox**: enables or disables that layer.
-- **Color button**: changes the edge color, including alpha when supported by the picker.
-- **Low / High**: Canny hysteresis thresholds for the selected layer.
-- **Delete**: removes the layer.
-
-Layers are rendered from top to bottom in the controls. Later layers are composited over earlier layers.
-
 ## Notes
 
-`imageproc::edges::canny` accepts floating-point thresholds. Its useful range can exceed the familiar OpenCV `0..255` range, so the UI allows values up to `1140`.
+The first layer is special:
+
+- it computes a weighted green center from green pixels
+- it finds the connected green component that contains or is closest to that center
+- it outlines that selected closed green shape
+- it can also find and outline holes
+
+The additional edge layers use a simple adaptive Sobel + hysteresis edge detector. Their thresholds can be reduced near the green shape so weak leaf boundaries are easier to keep.
