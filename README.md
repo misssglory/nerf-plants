@@ -192,3 +192,28 @@ through the wrapper pinned to Gradle 9.5.0.
 `mainExecutor`. A Kotlin property named `mainExecutor` generates a JVM getter
 called `getMainExecutor()`, which collides with the method inherited by
 `AppCompatActivity` from Android `Context`.
+
+---
+
+## Nerfstudio reconstruction on NixOS
+
+An additional shell and complete video-to-model workflow now live in
+`reconstruction/`.
+
+```bash
+nix develop .#nerfstudio
+cd reconstruction
+./setup.sh
+./process-video.sh "$HOME/PlantCaptures/capture.mp4" plant_001 120
+./train.sh plant_001 nerfacto
+CONFIG="$(./latest-config.sh plant_001)"
+./export-mesh.sh "$CONFIG" plant_001 poisson
+```
+
+See [`reconstruction/README.md`](reconstruction/README.md) for Splatfacto,
+mesh export, scaling and troubleshooting notes. The existing Android shell is
+still the default; it can also be entered explicitly with:
+
+```bash
+nix develop .#android
+```

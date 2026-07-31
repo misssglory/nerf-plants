@@ -20,18 +20,8 @@ internal object UploadClient {
         return value
     }
 
-    fun testConnection(baseUrl: String): Result {
-        val connection = (URL("${normalizeBaseUrl(baseUrl)}/health").openConnection() as HttpURLConnection)
-        return connection.useConnection {
-            requestMethod = "GET"
-            connectTimeout = 5_000
-            readTimeout = 5_000
-            useCaches = false
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("Connection", "close")
-            connect()
-            Result(responseCode, readResponseBody())
-        }
+    fun testConnection(baseUrl: String, token: String): Result {
+        return checkReady(baseUrl, token.trim())
     }
 
     fun upload(
@@ -42,12 +32,13 @@ internal object UploadClient {
         onProgress: (Int) -> Unit,
     ): Result {
         require(file.isFile && file.length() > 0L) { "Video file is missing or empty" }
-        require(token.length >= 10) { "Token must contain at least 10 characters" }
+        val normalizedToken = token.trim()
+        require(normalizedToken.length >= 10) { "Token must contain at least 10 characters" }
 
         // Validate the shared token before streaming a potentially large file.
         // This also makes a 401/404/limit error visible instead of leaving the
         // server with an unread MP4 request body.
-        val ready = checkReady(baseUrl, token)
+        val ready = checkReady(baseUrl, normalizedToken)
         require(ready.code in 200..299) {
             "Receiver preflight failed: HTTP ${ready.code}: ${ready.body}"
         }
@@ -65,7 +56,7 @@ internal object UploadClient {
             connectTimeout = 15_000
             readTimeout = 120_000
             setFixedLengthStreamingMode(file.length())
-            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Authorization", "Bearer $normalizedToken")
             setRequestProperty("Content-Type", "video/mp4")
             setRequestProperty("Accept", "application/json")
             setRequestProperty("Connection", "close")
@@ -100,6 +91,8 @@ internal object UploadClient {
 
 
     private fun checkReady(baseUrl: String, token: String): Result {
+        val normalizedToken = token.trim()
+        require(normalizedToken.length >= 10) { "Token must contain at least 10 characters" }
         val connection = (
             URL("${normalizeBaseUrl(baseUrl)}/ready").openConnection() as HttpURLConnection
             )
@@ -108,7 +101,7 @@ internal object UploadClient {
             useCaches = false
             connectTimeout = 5_000
             readTimeout = 5_000
-            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Authorization", "Bearer $normalizedToken")
             setRequestProperty("Accept", "application/json")
             setRequestProperty("Connection", "close")
             connect()

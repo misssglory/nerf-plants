@@ -193,16 +193,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun testPcConnection() {
+        val baseUrl = serverUrl.text.toString().trim()
+        val sharedToken = token.text.toString().trim()
         testConnection.isEnabled = false
-        setStatus("Testing PC receiver…")
+        setStatus("Testing PC receiver and token…")
         worker.execute {
-            val result = runCatching { UploadClient.testConnection(serverUrl.text.toString()) }
+            val result = runCatching { UploadClient.testConnection(baseUrl, sharedToken) }
             runOnUiThread {
                 testConnection.isEnabled = true
                 result.onSuccess {
-                    setStatus("PC replied HTTP ${it.code}: ${it.body}")
+                    if (it.code in 200..299) {
+                        setStatus("PC and token accepted. HTTP ${it.code}: ${it.body}")
+                    } else {
+                        setStatus("Receiver rejected credentials. HTTP ${it.code}: ${it.body}")
+                    }
                 }.onFailure {
-                    setStatus("Connection failed: ${it.message}. Check IP, firewall, and Wi‑Fi.")
+                    setStatus("Connection failed: ${it.message}. Check URL, token, firewall, and Wi‑Fi.")
                 }
             }
         }
@@ -210,8 +216,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun uploadVideo(file: File) {
         val metadata = CaptureMetadata.from(file, cameraController.state).toJson()
-        val baseUrl = serverUrl.text.toString()
-        val sharedToken = token.text.toString()
+        val baseUrl = serverUrl.text.toString().trim()
+        val sharedToken = token.text.toString().trim()
         setStatus("Uploading ${formatBytes(file.length())} to PC…")
 
         worker.execute {
@@ -243,7 +249,7 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences("plant_capture", MODE_PRIVATE)
             .edit()
             .putString("server_url", serverUrl.text.toString().trim())
-            .putString("token", token.text.toString())
+            .putString("token", token.text.toString().trim())
             .apply()
     }
 

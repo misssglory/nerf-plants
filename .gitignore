@@ -5,3 +5,9 @@ local.properties
 **/__pycache__/
 *.pyc
 *.part
+*.bkp
+*.png
+*/data/*
+*/outputs/*
+
+

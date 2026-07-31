@@ -1,0 +1,29 @@
+[workspace]
+name = "plant-capture-nerfstudio"
+description = "Pinned Nerfstudio environment for Plant Capture"
+channels = ["nvidia/label/cuda-11.8.0", "nvidia", "conda-forge", "pytorch"]
+platforms = [{ platform = "linux-64", glibc = "2.30" }]
+
+[dependencies]
+python = "3.10.*"
+# PyTorch 2.2 and several compiled dependencies in this pinned stack were
+# built against the NumPy 1.x ABI. NumPy 2.x makes torch report
+# "Numpy is not available" during dataset conversion.
+numpy = "1.26.*"
+pip = ">=24.0,<25"
+cuda = { version = "11.8.*", channel = "nvidia/label/cuda-11.8.0" }
+pytorch-cuda = { version = "11.8.*", channel = "pytorch" }
+pytorch = { version = ">=2.2.0,<2.3", channel = "pytorch" }
+torchvision = { version = ">=0.17.0,<0.18", channel = "pytorch" }
+colmap = "3.9.1.*"
+ffmpeg = ">=6,<8"
+ninja = ">=1.10"
+cmake = ">=3.27"
+git = ">=2.40"
+
+[pypi-dependencies]
+nerfstudio = "==1.1.5"
+
+[tasks]
+check = "python verify_environment.py"
+ns-help = "ns-train --help"
