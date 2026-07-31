@@ -1,27 +1,47 @@
-# Rust Canny Edge Viewer
+# Rust Multi-layer Edge Viewer
 
-Interactive Canny edge detection with Rust, `egui`, `image`, and `imageproc`.
+Native `egui`/`eframe` application for interactively composing several colored Canny edge layers.
 
-## Run in the Nix development shell
+## Features
+
+- Load an image from a CLI path, native file dialog, or drag-and-drop.
+- Side-by-side original and layered-edge previews.
+- Independent preview scaling for original and edge images (`0.1×` to `8×`).
+- Add and delete any number of edge layers.
+- Enable/disable each layer independently.
+- Separate Canny low/high thresholds and color for each layer.
+- Shared optional Gaussian pre-blur.
+- Black or white output background.
+- Alpha-aware color compositing when layer edges overlap.
+- Live recalculation while sliders are dragged, with an option to disable it.
+- Save the rendered layered edge image as PNG.
+
+## Run with Nix
 
 ```bash
 nix develop
 cargo run --release -- /path/to/image.jpg
 ```
 
-The image argument is optional. You can open or drag an image into the window.
+Or start without an image:
+
+```bash
+cargo run --release
+```
 
 ## Controls
 
-- Low and high Canny hysteresis thresholds
-- Optional Gaussian pre-blur
-- Inverted output
-- Live update while dragging sliders
-- Open, drag-and-drop, and save as PNG
+- **Original / Edges scale**: each preview is scaled independently. `1×` fits large images to their column; values above `1×` can be explored with scrollbars.
+- **Pre-blur σ**: Gaussian blur applied once before all Canny layers.
+- **White background**: switches the edge composite from black to white.
+- **Add layer**: creates another independently configured Canny layer.
+- **Layer checkbox**: enables or disables that layer.
+- **Color button**: changes the edge color, including alpha when supported by the picker.
+- **Low / High**: Canny hysteresis thresholds for the selected layer.
+- **Delete**: removes the layer.
 
-`imageproc::edges::canny` uses a fixed internal Gaussian blur. The extra blur slider applies an additional blur before Canny, which is useful for suppressing fine texture and noise.
+Layers are rendered from top to bottom in the controls. Later layers are composited over earlier layers.
 
-## egui 0.35 API note
+## Notes
 
-This project targets `eframe = 0.35.0`. In this release, applications implement
-`App::ui(&mut Ui, &mut Frame)`, and side/top/bottom layouts use `egui::Panel`.
+`imageproc::edges::canny` accepts floating-point thresholds. Its useful range can exceed the familiar OpenCV `0..255` range, so the UI allows values up to `1140`.

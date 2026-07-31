@@ -2,10 +2,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use eframe::egui;
-use image::{DynamicImage, GrayImage, RgbaImage};
+use image::{DynamicImage, GrayImage, Rgba, RgbaImage};
 use imageproc::{edges::canny, filter::gaussian_blur_f32};
 
 const MAX_CANNY_THRESHOLD: f32 = 1140.0;
+const MIN_PREVIEW_SCALE: f32 = 0.10;
+const MAX_PREVIEW_SCALE: f32 = 8.00;
 
 fn main() -> eframe::Result {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -13,14 +15,14 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([820.0, 560.0])
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([900.0, 600.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Rust Canny Edge Viewer",
+        "Rust Multi-layer Edge Viewer",
         native_options,
         Box::new(move |creation_context| {
             Ok(Box::new(EdgeApp::new(
@@ -31,22 +33,48 @@ fn main() -> eframe::Result {
     )
 }
 
+#[derive(Clone)]
+struct EdgeLayer {
+    id: u64,
+    enabled: bool,
+    low_threshold: f32,
+    high_threshold: f32,
+    color: egui::Color32,
+    edge_pixels: usize,
+}
+
+impl EdgeLayer {
+    fn new(id: u64, low_threshold: f32, high_threshold: f32, color: egui::Color32) -> Self {
+        Self {
+            id,
+            enabled: true,
+            low_threshold,
+            high_threshold,
+            color,
+            edge_pixels: 0,
+        }
+    }
+}
+
 struct EdgeApp {
     image_path: Option<PathBuf>,
     original_rgba: Option<RgbaImage>,
     original_gray: Option<GrayImage>,
-    edges: Option<GrayImage>,
+    composite_edges: Option<RgbaImage>,
     original_texture: Option<egui::TextureHandle>,
     edge_texture: Option<egui::TextureHandle>,
 
-    low_threshold: f32,
-    high_threshold: f32,
+    layers: Vec<EdgeLayer>,
+    next_layer_id: u64,
     preblur_sigma: f32,
-    invert_edges: bool,
+    white_background: bool,
     update_while_dragging: bool,
     dirty: bool,
 
-    edge_pixels: usize,
+    original_preview_scale: f32,
+    edge_preview_scale: f32,
+
+    composite_edge_pixels: usize,
     status: String,
     error: Option<String>,
 }
@@ -57,16 +85,23 @@ impl EdgeApp {
             image_path: None,
             original_rgba: None,
             original_gray: None,
-            edges: None,
+            composite_edges: None,
             original_texture: None,
             edge_texture: None,
-            low_threshold: 50.0,
-            high_threshold: 150.0,
+            layers: vec![EdgeLayer::new(
+                1,
+                50.0,
+                150.0,
+                egui::Color32::from_rgb(0, 220, 255),
+            )],
+            next_layer_id: 2,
             preblur_sigma: 0.0,
-            invert_edges: false,
+            white_background: false,
             update_while_dragging: true,
             dirty: false,
-            edge_pixels: 0,
+            original_preview_scale: 1.0,
+            edge_preview_scale: 1.0,
+            composite_edge_pixels: 0,
             status: "Open an image or drop one into the window.".to_owned(),
             error: None,
         };
@@ -102,13 +137,24 @@ impl EdgeApp {
         }
     }
 
+    fn add_layer(&mut self) {
+        let (low, high) = self
+            .layers
+            .last()
+            .map(|layer| (layer.low_threshold, layer.high_threshold))
+            .unwrap_or((50.0, 150.0));
+
+        let color = layer_palette(self.layers.len());
+        let id = self.next_layer_id;
+        self.next_layer_id += 1;
+        self.layers.push(EdgeLayer::new(id, low, high, color));
+        self.dirty = true;
+    }
+
     fn recompute_edges(&mut self, ctx: &egui::Context) {
         let Some(gray) = self.original_gray.as_ref() else {
             return;
         };
-
-        let low = self.low_threshold.min(self.high_threshold);
-        let high = self.high_threshold.max(self.low_threshold);
 
         let blurred;
         let input = if self.preblur_sigma > 0.01 {
@@ -118,49 +164,74 @@ impl EdgeApp {
             gray
         };
 
-        let mut edges = canny(input, low, high);
+        let width = input.width();
+        let height = input.height();
+        let background = if self.white_background {
+            Rgba([255, 255, 255, 255])
+        } else {
+            Rgba([0, 0, 0, 255])
+        };
 
-        if self.invert_edges {
-            for pixel in edges.pixels_mut() {
-                pixel.0[0] = 255 - pixel.0[0];
+        let mut composite = RgbaImage::from_pixel(width, height, background);
+        let mut covered = vec![false; width as usize * height as usize];
+
+        for layer in &mut self.layers {
+            layer.edge_pixels = 0;
+            if !layer.enabled {
+                continue;
+            }
+
+            let low = layer.low_threshold.min(layer.high_threshold);
+            let high = layer.high_threshold.max(layer.low_threshold);
+            let mask = canny(input, low, high);
+            let layer_color = layer.color.to_srgba_unmultiplied();
+
+            for (index, (mask_pixel, output_pixel)) in
+                mask.pixels().zip(composite.pixels_mut()).enumerate()
+            {
+                if mask_pixel.0[0] == 0 {
+                    continue;
+                }
+
+                layer.edge_pixels += 1;
+                covered[index] = true;
+                blend_srgba_over(output_pixel, layer_color);
             }
         }
 
-        self.edge_pixels = if self.invert_edges {
-            edges.pixels().filter(|pixel| pixel.0[0] == 0).count()
-        } else {
-            edges.pixels().filter(|pixel| pixel.0[0] != 0).count()
-        };
+        self.composite_edge_pixels = covered.into_iter().filter(|covered| *covered).count();
 
-        let color_image = gray_to_color_image(&edges);
+        let color_image = rgba_to_color_image(&composite);
         match self.edge_texture.as_mut() {
             Some(texture) => texture.set(color_image, egui::TextureOptions::NEAREST),
             None => {
                 self.edge_texture = Some(ctx.load_texture(
-                    "edge-image",
+                    "edge-composite",
                     color_image,
                     egui::TextureOptions::NEAREST,
                 ));
             }
         }
 
-        let total_pixels = edges.width() as usize * edges.height() as usize;
+        let total_pixels = width as usize * height as usize;
         let percentage = if total_pixels == 0 {
             0.0
         } else {
-            self.edge_pixels as f64 * 100.0 / total_pixels as f64
+            self.composite_edge_pixels as f64 * 100.0 / total_pixels as f64
         };
+        let enabled_layers = self.layers.iter().filter(|layer| layer.enabled).count();
 
         self.status = format!(
-            "Canny complete: {} edge pixels ({percentage:.2}%)",
-            self.edge_pixels
+            "Rendered {enabled_layers} layer(s): {} unique edge pixels ({percentage:.2}%)",
+            self.composite_edge_pixels
         );
-        self.edges = Some(edges);
+        self.composite_edges = Some(composite);
         self.dirty = false;
+        self.error = None;
     }
 
     fn save_edges(&mut self) {
-        let Some(edges) = self.edges.as_ref() else {
+        let Some(edges) = self.composite_edges.as_ref() else {
             self.error = Some("There is no processed image to save.".to_owned());
             return;
         };
@@ -170,11 +241,11 @@ impl EdgeApp {
             .as_deref()
             .and_then(Path::file_stem)
             .and_then(|name| name.to_str())
-            .map(|name| format!("{name}_edges.png"))
-            .unwrap_or_else(|| "edges.png".to_owned());
+            .map(|name| format!("{name}_edge_layers.png"))
+            .unwrap_or_else(|| "edge_layers.png".to_owned());
 
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Save edge image")
+            .set_title("Save layered edge image")
             .set_file_name(suggested_name)
             .add_filter("PNG image", &["png"])
             .save_file()
@@ -183,7 +254,7 @@ impl EdgeApp {
         };
 
         let path = ensure_png_extension(path);
-        match DynamicImage::ImageLuma8(edges.clone()).save(&path) {
+        match DynamicImage::ImageRgba8(edges.clone()).save(&path) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
                 self.error = None;
@@ -210,114 +281,208 @@ impl EdgeApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Canny controls");
-        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.heading("Edge compositor");
+                ui.add_space(4.0);
 
-        if ui.button("Open image…").clicked() {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Open image")
-                .add_filter("Image", &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"])
-                .pick_file()
-            {
-                self.load_image(&path, ctx);
-            }
-        }
+                if ui.button("Open image…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Open image")
+                        .add_filter(
+                            "Image",
+                            &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
+                        )
+                        .pick_file()
+                    {
+                        self.load_image(&path, ctx);
+                    }
+                }
 
-        if ui
-            .add_enabled(self.edges.is_some(), egui::Button::new("Save edges…"))
-            .clicked()
-        {
-            self.save_edges();
-        }
+                if ui
+                    .add_enabled(
+                        self.composite_edges.is_some(),
+                        egui::Button::new("Save layered edges…"),
+                    )
+                    .clicked()
+                {
+                    self.save_edges();
+                }
 
-        ui.separator();
+                ui.separator();
+                ui.strong("Preview scale");
 
-        let mut parameters_changed = false;
-        parameters_changed |= ui
-            .add(
-                egui::Slider::new(
-                    &mut self.low_threshold,
-                    0.0..=self.high_threshold.max(0.0),
-                )
-                .text("Low threshold")
-                .clamping(egui::SliderClamping::Always),
-            )
-            .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Original");
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.original_preview_scale,
+                            MIN_PREVIEW_SCALE..=MAX_PREVIEW_SCALE,
+                        )
+                        .logarithmic(true)
+                        .suffix("×"),
+                    );
+                    if ui.small_button("Reset").clicked() {
+                        self.original_preview_scale = 1.0;
+                    }
+                });
 
-        parameters_changed |= ui
-            .add(
-                egui::Slider::new(
-                    &mut self.high_threshold,
-                    self.low_threshold..=MAX_CANNY_THRESHOLD,
-                )
-                .text("High threshold")
-                .clamping(egui::SliderClamping::Always),
-            )
-            .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Edges");
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.edge_preview_scale,
+                            MIN_PREVIEW_SCALE..=MAX_PREVIEW_SCALE,
+                        )
+                        .logarithmic(true)
+                        .suffix("×"),
+                    );
+                    if ui.small_button("Reset").clicked() {
+                        self.edge_preview_scale = 1.0;
+                    }
+                });
 
-        parameters_changed |= ui
-            .add(
-                egui::Slider::new(&mut self.preblur_sigma, 0.0..=10.0)
-                    .text("Extra blur σ")
-                    .fixed_decimals(2),
-            )
-            .changed();
+                if ui.button("Use same scale for both").clicked() {
+                    self.edge_preview_scale = self.original_preview_scale;
+                }
 
-        parameters_changed |= ui.checkbox(&mut self.invert_edges, "Invert output").changed();
+                ui.small("1× fits a large image to its preview column; larger values enable scrolling.");
 
-        ui.checkbox(
-            &mut self.update_while_dragging,
-            "Update while dragging sliders",
-        );
+                ui.separator();
+                ui.strong("Shared processing");
 
-        if parameters_changed {
-            self.dirty = true;
-        }
+                let mut parameters_changed = ui
+                    .add(
+                        egui::Slider::new(&mut self.preblur_sigma, 0.0..=10.0)
+                            .text("Pre-blur σ")
+                            .fixed_decimals(2),
+                    )
+                    .changed();
 
-        let pointer_down = ui.input(|input| input.pointer.primary_down());
-        if self.dirty && (self.update_while_dragging || !pointer_down) {
-            self.recompute_edges(ctx);
-        }
+                parameters_changed |= ui
+                    .checkbox(&mut self.white_background, "White background")
+                    .changed();
 
-        if ui
-            .add_enabled(self.dirty, egui::Button::new("Apply parameters"))
-            .clicked()
-        {
-            self.recompute_edges(ctx);
-        }
+                ui.checkbox(
+                    &mut self.update_while_dragging,
+                    "Update while dragging sliders",
+                );
 
-        ui.separator();
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.strong(format!("Layers ({})", self.layers.len()));
+                    if ui.button("＋ Add layer").clicked() {
+                        self.add_layer();
+                    }
+                });
 
-        if let Some(path) = self.image_path.as_ref() {
-            ui.label("Input");
-            ui.monospace(path.display().to_string());
-        }
+                let mut layer_to_remove = None;
 
-        if let Some(gray) = self.original_gray.as_ref() {
-            ui.label(format!("Resolution: {} × {}", gray.width(), gray.height()));
-            ui.label(format!("Edge pixels: {}", self.edge_pixels));
-        }
+                for (index, layer) in self.layers.iter_mut().enumerate() {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            parameters_changed |= ui.checkbox(&mut layer.enabled, "").changed();
+                            ui.strong(format!("Layer {}", index + 1));
+                            ui.add_space(4.0);
+                            parameters_changed |= ui.color_edit_button_srgba(&mut layer.color).changed();
 
-        ui.separator();
-        ui.small(
-            "Tip: lower thresholds detect more weak detail. Extra blur suppresses leaf texture and image noise before Canny.",
-        );
-        ui.small("You can also drag and drop an image into the window.");
+                            if ui.small_button("Delete").clicked() {
+                                layer_to_remove = Some(layer.id);
+                            }
+                        });
+
+                        parameters_changed |= ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut layer.low_threshold,
+                                    0.0..=layer.high_threshold.max(0.0),
+                                )
+                                .text("Low")
+                                .clamping(egui::SliderClamping::Always),
+                            )
+                            .changed();
+
+                        parameters_changed |= ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut layer.high_threshold,
+                                    layer.low_threshold..=MAX_CANNY_THRESHOLD,
+                                )
+                                .text("High")
+                                .clamping(egui::SliderClamping::Always),
+                            )
+                            .changed();
+
+                        ui.small(format!("Detected pixels: {}", layer.edge_pixels));
+                    });
+                    ui.add_space(4.0);
+                }
+
+                if let Some(id) = layer_to_remove {
+                    self.layers.retain(|layer| layer.id != id);
+                    parameters_changed = true;
+                }
+
+                if parameters_changed {
+                    self.dirty = true;
+                }
+
+                let pointer_down = ui.input(|input| input.pointer.primary_down());
+                if self.dirty && (self.update_while_dragging || !pointer_down) {
+                    self.recompute_edges(ctx);
+                }
+
+                if ui
+                    .add_enabled(self.dirty, egui::Button::new("Apply parameters"))
+                    .clicked()
+                {
+                    self.recompute_edges(ctx);
+                }
+
+                ui.separator();
+
+                if let Some(path) = self.image_path.as_ref() {
+                    ui.label("Input");
+                    ui.monospace(path.display().to_string());
+                }
+
+                if let Some(gray) = self.original_gray.as_ref() {
+                    ui.label(format!("Resolution: {} × {}", gray.width(), gray.height()));
+                    ui.label(format!(
+                        "Unique composite edge pixels: {}",
+                        self.composite_edge_pixels
+                    ));
+                }
+
+                ui.separator();
+                ui.small(
+                    "Each enabled layer runs Canny with its own thresholds. Edge colors are composited in layer order; later layers are drawn over earlier ones.",
+                );
+                ui.small("You can also drag and drop an image into the window.");
+            });
     }
 
     fn previews(&self, ui: &mut egui::Ui) {
         ui.columns(2, |columns| {
-            preview_panel(&mut columns[0], "Original", self.original_texture.as_ref());
-            preview_panel(&mut columns[1], "Edges", self.edge_texture.as_ref());
+            preview_panel(
+                &mut columns[0],
+                "Original",
+                self.original_texture.as_ref(),
+                self.original_preview_scale,
+            );
+            preview_panel(
+                &mut columns[1],
+                "Layered edges",
+                self.edge_texture.as_ref(),
+                self.edge_preview_scale,
+            );
         });
     }
 }
 
 impl eframe::App for EdgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // egui 0.35 moved the main application entry point from Context to Ui.
-        // Clone the cheap context handle so image loading and texture updates can
-        // still use it without borrowing the root Ui for the whole frame.
         let ctx = ui.ctx().clone();
 
         self.handle_dropped_files(&ctx);
@@ -333,8 +498,10 @@ impl eframe::App for EdgeApp {
         });
 
         egui::Panel::left("controls")
-            .resizable(false)
-            .default_size(260.0)
+            .resizable(true)
+            .default_size(360.0)
+            .min_size(300.0)
+            .max_size(560.0)
             .show(ui, |ui| {
                 self.controls(ui, &ctx);
             });
@@ -358,19 +525,58 @@ fn rgba_to_color_image(image: &RgbaImage) -> egui::ColorImage {
     )
 }
 
-fn gray_to_color_image(image: &GrayImage) -> egui::ColorImage {
-    egui::ColorImage::from_gray(
-        [image.width() as usize, image.height() as usize],
-        image.as_raw(),
-    )
+fn blend_srgba_over(destination: &mut Rgba<u8>, source: [u8; 4]) {
+    let source_alpha = source[3] as f32 / 255.0;
+    if source_alpha <= 0.0 {
+        return;
+    }
+
+    let destination_alpha = destination.0[3] as f32 / 255.0;
+    let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+
+    if output_alpha <= f32::EPSILON {
+        destination.0 = [0, 0, 0, 0];
+        return;
+    }
+
+    for channel in 0..3 {
+        let source_value = source[channel] as f32 / 255.0;
+        let destination_value = destination.0[channel] as f32 / 255.0;
+        let output_value = (source_value * source_alpha
+            + destination_value * destination_alpha * (1.0 - source_alpha))
+            / output_alpha;
+        destination.0[channel] = (output_value * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+
+    destination.0[3] = (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+fn layer_palette(index: usize) -> egui::Color32 {
+    const COLORS: [[u8; 3]; 8] = [
+        [0, 220, 255],
+        [255, 70, 170],
+        [255, 210, 40],
+        [110, 255, 100],
+        [170, 100, 255],
+        [255, 120, 40],
+        [80, 150, 255],
+        [255, 255, 255],
+    ];
+
+    let [r, g, b] = COLORS[index % COLORS.len()];
+    egui::Color32::from_rgb(r, g, b)
 }
 
 fn preview_panel(
     ui: &mut egui::Ui,
     title: &str,
     texture: Option<&egui::TextureHandle>,
+    preview_scale: f32,
 ) {
-    ui.heading(title);
+    ui.horizontal(|ui| {
+        ui.heading(title);
+        ui.weak(format!("{preview_scale:.2}×"));
+    });
     ui.separator();
 
     let Some(texture) = texture else {
@@ -380,13 +586,14 @@ fn preview_panel(
         return;
     };
 
+    let available_width = ui.available_width().max(1.0);
+
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let texture_size = texture.size_vec2();
-            let available_width = ui.available_width().max(1.0);
-            let scale = (available_width / texture_size.x).min(1.0);
-            let display_size = texture_size * scale;
+            let fit_scale = (available_width / texture_size.x).min(1.0);
+            let display_size = texture_size * fit_scale * preview_scale;
 
             ui.add(
                 egui::Image::new(texture)
