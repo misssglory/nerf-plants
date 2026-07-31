@@ -1,0 +1,16 @@
+[package]
+name = "rust-edge-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+eframe = { version = "=0.35.0", default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "wayland",
+  "x11",
+] }
+image = "0.25"
+imageproc = "0.27"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
