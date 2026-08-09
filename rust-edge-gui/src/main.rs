@@ -1,4 +1,7 @@
 use std::collections::VecDeque;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -13,6 +16,8 @@ use rayon::prelude::*;
 const MAX_EDGE_THRESHOLD: f32 = 1140.0;
 const MIN_SCALE: f32 = 0.10;
 const MAX_SCALE: f32 = 8.0;
+const SOURCE_HISTORY_LIMIT: usize = 40;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> eframe::Result {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -218,8 +223,63 @@ impl ProcessingWorker {
     }
 }
 
+
+struct SourceRequest {
+    id: u64,
+    source: String,
+}
+
+struct SourceLoaded {
+    id: u64,
+    source: String,
+    resolved_source: String,
+    image_path: Option<PathBuf>,
+    rgba: RgbaImage,
+    gray: GrayImage,
+}
+
+enum SourceMessage {
+    Loaded(SourceLoaded),
+    Failed {
+        id: u64,
+        source: String,
+        error: String,
+    },
+}
+
+struct SourceWorker {
+    job_tx: mpsc::Sender<SourceRequest>,
+    message_rx: mpsc::Receiver<SourceMessage>,
+    _thread: thread::JoinHandle<()>,
+}
+
+impl SourceWorker {
+    fn spawn() -> Self {
+        let (job_tx, job_rx) = mpsc::channel::<SourceRequest>();
+        let (message_tx, message_rx) = mpsc::channel::<SourceMessage>();
+        let worker_thread = thread::Builder::new()
+            .name("image-source-worker".to_owned())
+            .spawn(move || source_worker_loop(job_rx, message_tx))
+            .expect("failed to start image source worker");
+
+        Self {
+            job_tx,
+            message_rx,
+            _thread: worker_thread,
+        }
+    }
+}
+
 struct EdgeApp {
     image_path: Option<PathBuf>,
+    image_source: Option<String>,
+    source_input: String,
+    source_history: VecDeque<String>,
+    source_history_path: PathBuf,
+    source_worker: SourceWorker,
+    next_source_id: u64,
+    active_source_id: u64,
+    source_loading: bool,
     original_rgba: Option<Arc<RgbaImage>>,
     original_gray: Option<Arc<GrayImage>>,
     original_texture: Option<egui::TextureHandle>,
@@ -256,8 +316,19 @@ impl EdgeApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         configure_black_visuals(&cc.egui_ctx);
 
+        let source_history_path = source_history_path();
+        let source_history = load_source_history(&source_history_path);
+
         let mut app = Self {
             image_path: None,
+            image_source: None,
+            source_input: String::new(),
+            source_history,
+            source_history_path,
+            source_worker: SourceWorker::spawn(),
+            next_source_id: 0,
+            active_source_id: 0,
+            source_loading: false,
             original_rgba: None,
             original_gray: None,
             original_texture: None,
@@ -275,7 +346,7 @@ impl EdgeApp {
             original_scale: 1.0,
             composite_scale: 1.0,
             unique_edge_pixels: 0,
-            status: "Open an image or drop one into the window.".to_owned(),
+            status: "Open a local image, drop one here, or enter an ESP32 camera address.".to_owned(),
             error: None,
             worker: ProcessingWorker::spawn(),
             next_job_id: 0,
@@ -286,33 +357,85 @@ impl EdgeApp {
         };
 
         if let Some(path) = initial_path {
-            app.load_image(&path, &cc.egui_ctx);
+            app.source_input = path.display().to_string();
+            app.load_source(app.source_input.clone());
         }
 
         app
     }
 
-    fn load_image(&mut self, path: &Path, ctx: &egui::Context) {
-        match load_image_data(path) {
-            Ok((rgba, gray)) => {
-                self.original_texture = Some(ctx.load_texture(
-                    "original-image",
-                    rgba_to_color_image(&rgba),
-                    egui::TextureOptions::LINEAR,
-                ));
-                self.image_path = Some(path.to_owned());
-                self.original_rgba = Some(Arc::new(rgba));
-                self.original_gray = Some(Arc::new(gray));
-                self.original_scale = 1.0;
-                self.composite_scale = 1.0;
-                self.error = None;
-                self.status = format!("Loaded {}", path.display());
-                self.dirty = true;
-                self.schedule_recompute();
+    fn load_source(&mut self, source: String) {
+        let source = source.trim().to_owned();
+        if source.is_empty() {
+            self.error = Some("Enter an image path or controller address first.".to_owned());
+            return;
+        }
+
+        self.source_input = source.clone();
+        self.next_source_id = self.next_source_id.wrapping_add(1).max(1);
+        self.active_source_id = self.next_source_id;
+        self.source_loading = true;
+        self.error = None;
+        self.status = format!("Loading {source} …");
+
+        if let Err(error) = self.source_worker.job_tx.send(SourceRequest {
+            id: self.active_source_id,
+            source,
+        }) {
+            self.source_loading = false;
+            self.error = Some(format!("Image source worker stopped: {error}"));
+        }
+    }
+
+    fn finish_loaded_source(&mut self, loaded: SourceLoaded, ctx: &egui::Context) {
+        self.original_texture = Some(ctx.load_texture(
+            "original-image",
+            rgba_to_color_image(&loaded.rgba),
+            egui::TextureOptions::LINEAR,
+        ));
+        self.image_path = loaded.image_path;
+        self.image_source = Some(loaded.source.clone());
+        self.original_rgba = Some(Arc::new(loaded.rgba));
+        self.original_gray = Some(Arc::new(loaded.gray));
+        self.original_scale = 1.0;
+        self.composite_scale = 1.0;
+        self.error = None;
+        self.source_loading = false;
+        self.status = if loaded.source == loaded.resolved_source {
+            format!("Loaded {}", loaded.source)
+        } else {
+            format!("Loaded {} via {}", loaded.source, loaded.resolved_source)
+        };
+        self.remember_source(loaded.source);
+        self.dirty = true;
+        self.schedule_recompute();
+    }
+
+    fn remember_source(&mut self, source: String) {
+        self.source_history.retain(|entry| entry != &source);
+        self.source_history.push_front(source);
+        self.source_history.truncate(SOURCE_HISTORY_LIMIT);
+        if let Err(error) = save_source_history(&self.source_history_path, &self.source_history) {
+            self.status = format!("{} (history save warning: {error})", self.status);
+        }
+    }
+
+    fn poll_source_worker(&mut self, ctx: &egui::Context) {
+        while let Ok(message) = self.source_worker.message_rx.try_recv() {
+            match message {
+                SourceMessage::Loaded(loaded) if loaded.id == self.active_source_id => {
+                    self.finish_loaded_source(loaded, ctx);
+                }
+                SourceMessage::Failed { id, source, error } if id == self.active_source_id => {
+                    self.source_loading = false;
+                    self.error = Some(format!("Failed to load {source}: {error}"));
+                }
+                _ => {}
             }
-            Err(error) => {
-                self.error = Some(format!("Failed to load {}: {error:#}", path.display()));
-            }
+        }
+
+        if self.source_loading {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
 
@@ -477,25 +600,82 @@ impl EdgeApp {
         });
 
         if let Some(path) = dropped_paths.first() {
-            self.load_image(path, ctx);
+            self.load_source(path.display().to_string());
         }
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Green shape + edge composer");
         ui.add_space(6.0);
 
-        if ui.button("Open image…").clicked() {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Open image")
-                .add_filter(
-                    "Image",
-                    &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
-                )
-                .pick_file()
+        ui.label("Image source");
+        ui.small("Local path, controller IP/hostname, or full http:// URL. Bare host -> /capture; a full URL is used exactly as typed.");
+
+        let source_response = ui.add(
+            egui::TextEdit::singleline(&mut self.source_input)
+                .hint_text("192.168.1.42  |  esp32cam.local  |  /path/image.jpg")
+                .desired_width(f32::INFINITY),
+        );
+        let enter_pressed = source_response.lost_focus()
+            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.source_loading, egui::Button::new("Load source"))
+                .clicked()
+                || enter_pressed
             {
-                self.load_image(&path, ctx);
+                self.load_source(self.source_input.clone());
             }
+
+            if ui.button("Browse…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Open image")
+                    .add_filter(
+                        "Image",
+                        &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
+                    )
+                    .pick_file()
+                {
+                    self.source_input = path.display().to_string();
+                    self.load_source(self.source_input.clone());
+                }
+            }
+
+            let history_label = if self.source_history.is_empty() {
+                "History".to_owned()
+            } else {
+                format!("History ({})", self.source_history.len())
+            };
+            egui::ComboBox::from_id_salt("source-history")
+                .selected_text(history_label)
+                .show_ui(ui, |ui| {
+                    if self.source_history.is_empty() {
+                        ui.label("No previous sources yet");
+                    } else {
+                        let entries = self.source_history.iter().cloned().collect::<Vec<_>>();
+                        for entry in entries {
+                            if ui.selectable_label(false, &entry).clicked() {
+                                self.source_input = entry.clone();
+                                self.load_source(entry);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Clear history").clicked() {
+                            self.source_history.clear();
+                            let _ = save_source_history(&self.source_history_path, &self.source_history);
+                            ui.close();
+                        }
+                    }
+                });
+        });
+
+        if self.source_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.small("Fetching/decoding image…");
+            });
         }
 
         if ui
@@ -763,9 +943,9 @@ impl EdgeApp {
         }
 
         ui.separator();
-        if let Some(path) = self.image_path.as_ref() {
-            ui.label("Input file");
-            ui.monospace(path.display().to_string());
+        if let Some(source) = self.image_source.as_ref() {
+            ui.label("Current input");
+            ui.monospace(source);
         }
         if let Some(gray) = self.original_gray.as_ref() {
             ui.label(format!("Resolution: {} × {}", gray.width(), gray.height()));
@@ -796,10 +976,16 @@ impl eframe::App for EdgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_dropped_files(&ctx);
+        self.poll_source_worker(&ctx);
         self.poll_worker(&ctx);
 
         egui::Panel::bottom("status-bar").show(ui, |ui| {
-            if self.processing {
+            if self.source_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(&self.status);
+                });
+            } else if self.processing {
                 ui.horizontal(|ui| {
                     ui.label(&self.progress_stage);
                     ui.add(
@@ -821,7 +1007,7 @@ impl eframe::App for EdgeApp {
             .default_size(370.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.controls(ui, &ctx);
+                    self.controls(ui);
                 });
             });
 
@@ -1115,6 +1301,366 @@ fn show_zoomable_texture(
         });
 
     ui.small(format!("Scale: {:.2}×", *scale));
+}
+
+
+fn source_worker_loop(job_rx: mpsc::Receiver<SourceRequest>, message_tx: mpsc::Sender<SourceMessage>) {
+    while let Ok(mut request) = job_rx.recv() {
+        while let Ok(newer) = job_rx.try_recv() {
+            request = newer;
+        }
+
+        let id = request.id;
+        let source = request.source.clone();
+        match load_source_data(&source) {
+            Ok((resolved_source, image_path, rgba, gray)) => {
+                let _ = message_tx.send(SourceMessage::Loaded(SourceLoaded {
+                    id,
+                    source,
+                    resolved_source,
+                    image_path,
+                    rgba,
+                    gray,
+                }));
+            }
+            Err(error) => {
+                let _ = message_tx.send(SourceMessage::Failed {
+                    id,
+                    source,
+                    error: format!("{error:#}"),
+                });
+            }
+        }
+    }
+}
+
+fn load_source_data(source: &str) -> Result<(String, Option<PathBuf>, RgbaImage, GrayImage)> {
+    if looks_like_remote_source(source) {
+        let url = normalize_camera_url(source)?;
+        if url_path(&url).eq_ignore_ascii_case("/stream") {
+            anyhow::bail!("/stream is an MJPEG stream; use the controller address or /capture for one frame");
+        }
+        let bytes = fetch_http_bytes(&url)?;
+        let decoded = image::load_from_memory(&bytes)
+            .with_context(|| format!("unable to decode image returned by {url}"))?;
+        Ok((url, None, decoded.to_rgba8(), decoded.to_luma8()))
+    } else {
+        let path = expand_home_path(source);
+        let (rgba, gray) = load_image_data(&path)?;
+        Ok((path.display().to_string(), Some(path), rgba, gray))
+    }
+}
+
+fn looks_like_remote_source(source: &str) -> bool {
+    let source = source.trim();
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return true;
+    }
+    if Path::new(source).exists() || source.starts_with('/') || source.starts_with("./") || source.starts_with("../") || source.starts_with('~') {
+        return false;
+    }
+
+    let host_part = source.split('/').next().unwrap_or(source);
+    host_part.eq_ignore_ascii_case("localhost")
+        || host_part.ends_with(".local")
+        || host_part.parse::<std::net::IpAddr>().is_ok()
+        || host_part
+            .split_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+        || (!source.contains('/') && Path::new(source).extension().is_none())
+}
+
+fn normalize_camera_url(source: &str) -> Result<String> {
+    let source = source.trim();
+    if source.starts_with("https://") {
+        anyhow::bail!("HTTPS is not supported by the built-in ESP32 fetcher; use the controller's http:// address");
+    }
+
+    // A full URL is authoritative: use exactly the path the user typed.
+    // A bare controller hostname/IP is convenience shorthand for the
+    // CameraWebServer still-image endpoint at /capture.
+    if source.starts_with("http://") {
+        let after_scheme = &source["http://".len()..];
+        if after_scheme.is_empty() {
+            anyhow::bail!("controller address is empty");
+        }
+        return Ok(source.to_owned());
+    }
+
+    if source.is_empty() {
+        anyhow::bail!("controller address is empty");
+    }
+
+    let mut url = format!("http://{source}");
+    if !source.contains('/') {
+        url.push_str("/capture");
+    }
+    Ok(url)
+}
+
+fn url_path(url: &str) -> &str {
+    let rest = url.strip_prefix("http://").unwrap_or(url);
+    match rest.find('/') {
+        Some(index) => &rest[index..],
+        None => "/",
+    }
+}
+
+fn fetch_http_bytes(url: &str) -> Result<Vec<u8>> {
+    let rest = url
+        .strip_prefix("http://")
+        .context("only plain http:// controller URLs are supported")?;
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        anyhow::bail!("missing controller hostname in {url}");
+    }
+
+    let (host, port) = parse_http_authority(authority)?;
+    let socket_addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .with_context(|| format!("unable to resolve {host}"))?
+        .next()
+        .with_context(|| format!("no address found for {host}"))?;
+
+    let mut stream = TcpStream::connect_timeout(&socket_addr, HTTP_TIMEOUT)
+        .with_context(|| format!("unable to connect to {authority}"))?;
+    stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
+    stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: rust-edge-gui/0.3\r\nAccept: image/*\r\nConnection: close\r\n\r\n"
+    )?;
+    stream.flush()?;
+
+    let response = read_http_response(&mut stream, url)?;
+
+    let header_end = find_subslice(&response, b"\r\n\r\n")
+        .context("controller returned an invalid HTTP response")?;
+    let header_bytes = &response[..header_end];
+    let body = &response[header_end + 4..];
+    let headers = String::from_utf8_lossy(header_bytes);
+    let mut lines = headers.lines();
+    let status = lines.next().context("HTTP response has no status line")?;
+    let status_code = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|part| part.parse::<u16>().ok())
+        .context("unable to parse HTTP status")?;
+    if !(200..300).contains(&status_code) {
+        anyhow::bail!("controller returned HTTP {status_code} ({status})");
+    }
+
+    let chunked = headers.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    if chunked {
+        decode_chunked_body(body)
+    } else {
+        Ok(body.to_vec())
+    }
+}
+
+
+fn read_http_response(stream: &mut TcpStream, url: &str) -> Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&buffer[..count]);
+                if http_response_is_complete(&response) {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Linux commonly reports SO_RCVTIMEO expiry as EAGAIN (os error 11).
+                // If we already have an HTTP response, parse what arrived rather than
+                // turning that temporary socket condition into a misleading hard error.
+                if !response.is_empty() {
+                    break;
+                }
+                return Err(error).with_context(|| format!("timed out while reading {url}"));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed while reading {url}"));
+            }
+        }
+    }
+
+    if response.is_empty() {
+        anyhow::bail!("controller closed the connection without returning data: {url}");
+    }
+    Ok(response)
+}
+
+fn http_response_is_complete(response: &[u8]) -> bool {
+    let Some(header_end) = find_subslice(response, b"\r\n\r\n") else {
+        return false;
+    };
+    let body = &response[header_end + 4..];
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+
+    if let Some(content_length) = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    }) {
+        return body.len() >= content_length;
+    }
+
+    let chunked = headers.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    if chunked {
+        return chunked_body_is_complete(body);
+    }
+
+    false
+}
+
+fn chunked_body_is_complete(mut body: &[u8]) -> bool {
+    loop {
+        let Some(line_end) = find_subslice(body, b"\r\n") else {
+            return false;
+        };
+        let size_text = match std::str::from_utf8(&body[..line_end]) {
+            Ok(text) => text.split(';').next().unwrap_or("").trim(),
+            Err(_) => return false,
+        };
+        let size = match usize::from_str_radix(size_text, 16) {
+            Ok(size) => size,
+            Err(_) => return false,
+        };
+        body = &body[line_end + 2..];
+
+        if size == 0 {
+            // The terminating zero-size chunk is sufficient for the ESP32 responses
+            // we consume. Optional trailers, if any, are irrelevant to image decoding.
+            return body.len() >= 2;
+        }
+        if body.len() < size + 2 || &body[size..size + 2] != b"\r\n" {
+            return false;
+        }
+        body = &body[size + 2..];
+    }
+}
+
+fn parse_http_authority(authority: &str) -> Result<(String, u16)> {
+    if authority.starts_with('[') {
+        let end = authority.find(']').context("invalid IPv6 controller address")?;
+        let host = authority[1..end].to_owned();
+        let port = authority[end + 1..]
+            .strip_prefix(':')
+            .map(|p| p.parse::<u16>())
+            .transpose()
+            .context("invalid HTTP port")?
+            .unwrap_or(80);
+        return Ok((host, port));
+    }
+
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if !host.contains(':') {
+            return Ok((host.to_owned(), port.parse::<u16>().context("invalid HTTP port")?));
+        }
+    }
+    Ok((authority.to_owned(), 80))
+}
+
+fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = find_subslice(input, b"\r\n").context("invalid chunked HTTP body")?;
+        let size_line = std::str::from_utf8(&input[..line_end]).context("invalid chunk size")?;
+        let size_hex = size_line.split(';').next().unwrap_or(size_line).trim();
+        let size = usize::from_str_radix(size_hex, 16).context("invalid chunk size")?;
+        input = &input[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        if input.len() < size + 2 {
+            anyhow::bail!("truncated chunked HTTP body");
+        }
+        out.extend_from_slice(&input[..size]);
+        input = &input[size + 2..];
+    }
+    Ok(out)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn expand_home_path(source: &str) -> PathBuf {
+    if source == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = source.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(source)
+}
+
+fn source_history_path() -> PathBuf {
+    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(config)
+            .join("rust-edge-gui")
+            .join("source-history.txt");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("rust-edge-gui")
+            .join("source-history.txt");
+    }
+    PathBuf::from(".rust-edge-gui-source-history.txt")
+}
+
+fn load_source_history(path: &Path) -> VecDeque<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return VecDeque::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(SOURCE_HISTORY_LIMIT)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn save_source_history(path: &Path, history: &VecDeque<String>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create history directory {}", parent.display()))?;
+    }
+    let mut text = history.iter().cloned().collect::<Vec<_>>().join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    fs::write(path, text).with_context(|| format!("unable to save history to {}", path.display()))?;
+    Ok(())
 }
 
 fn load_image_data(path: &Path) -> Result<(RgbaImage, GrayImage)> {

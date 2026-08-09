@@ -1,6 +1,46 @@
-# Rust Green Shape + Edge Composer — async wgpu build
+# Rust Green Shape + Edge Composer — async wgpu + ESP32 camera input
 
 Native Rust/egui application for selecting a closed green plant shape, detecting holes, and compositing multiple adaptive edge layers.
+
+## What changed in 0.3
+
+- Added a unified **Image source** input for local files and ESP32 camera addresses.
+- Enter a bare controller address such as `192.168.1.42` or `esp32cam.local`; the app requests `http://<address>/capture`.
+- Full plain-HTTP URLs are used exactly as entered. For example, `http://192.168.1.42` requests `/`, while `http://192.168.1.42/capture
+http://192.168.1.42` requests `/capture`.
+- Remote fetch and image decoding run on a separate background worker, so the GUI does not freeze while the controller responds.
+- The source field has persistent history for the last 40 successful file paths and controller addresses.
+- History is deduplicated, newest-first, selectable from the **History** menu, and can be cleared from the UI.
+- Drag/drop and **Browse…** still work and now feed the same source/history pipeline.
+- No extra HTTP crate was added: the ESP32 fetcher uses a small built-in HTTP/1.1 client and supports normal and chunked responses.
+
+### ESP32 CameraWebServer usage
+
+For the standard Espressif `CameraWebServer`, type only the board address:
+
+```text
+192.168.1.42
+```
+
+The app resolves it to:
+
+```text
+http://192.168.1.42/capture
+```
+
+You can also enter the full endpoint yourself. `/stream` is intentionally rejected because it is an MJPEG stream; this application processes one still frame at a time.
+
+The source history is stored at:
+
+```text
+$XDG_CONFIG_HOME/rust-edge-gui/source-history.txt
+```
+
+or, when `XDG_CONFIG_HOME` is not set:
+
+```text
+~/.config/rust-edge-gui/source-history.txt
+```
 
 ## What changed in 0.2
 
