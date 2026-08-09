@@ -1,42 +1,89 @@
-# Rust Green Shape + Edge Composer
+# Rust Green Shape + Edge Composer — async wgpu build
 
-A small native Rust + egui tool for interactively finding a closed green shape (for example a leaf), then layering additional colored edge detections on top of a dimmed original image.
+Native Rust/egui application for selecting a closed green plant shape, detecting holes, and compositing multiple adaptive edge layers.
 
-## Features
+## What changed in 0.2
 
-- open image from CLI, file dialog, or drag-and-drop
-- black UI theme
-- original and overlay preview side by side
-- mouse-wheel zoom on the hovered preview
-- separate stored scale for original and overlay preview
-- dimmed original image underneath the overlay preview
-- locked **Layer 0** that finds the closed green shape around the weighted center of green pixels
-- hole detection inside the selected green shape
-- area statistics for the shape and its holes
-- multiple extra edge layers with separate thresholds, colors, and threshold reduction near the green shape
-- save the composite overlay as PNG
+- `eframe` now uses the `wgpu` renderer (`Vulkan` is preferred on Linux).
+- Heavy image processing runs on a background worker thread.
+- Slider changes use **latest-request-wins** cancellation, so stale results never replace newer settings.
+- Processing progress and stage are shown in the bottom bar.
+- CPU-heavy loops and independent edge layers use `rayon` parallelism.
+- Every extra edge layer has independent opacity.
+- Layer 0 outline has independent opacity.
+- A special green-area overlay is generated from Layer 0's selected shape.
+- The green-area overlay has color and opacity controls.
+- The selected green shape can become a real alpha mask in the saved PNG.
+- The dimmed original stays underneath the colored overlay.
+- Hovered-image mouse-wheel zoom remains available.
 
-## Build and run
+## Run with Nix
 
 ```bash
 nix develop
 cargo run --release -- /path/to/image.jpg
 ```
 
-or without an image:
+Check Vulkan availability:
 
 ```bash
-nix develop
-cargo run --release
+vulkaninfo --summary
 ```
 
-## Notes
+The flake exports:
 
-The first layer is special:
+```bash
+WGPU_BACKEND=vulkan
+```
 
-- it computes a weighted green center from green pixels
-- it finds the connected green component that contains or is closest to that center
-- it outlines that selected closed green shape
-- it can also find and outline holes
+To test another wgpu backend, override it before launch, for example:
 
-The additional edge layers use a simple adaptive Sobel + hysteresis edge detector. Their thresholds can be reduced near the green shape so weak leaf boundaries are easier to keep.
+```bash
+WGPU_BACKEND=gl cargo run --release -- image.jpg
+```
+
+The app still uses CPU processing for segmentation and edge detection. `wgpu` accelerates GUI and texture rendering; `rayon` accelerates the actual image-processing loops.
+
+## Important controls
+
+### Layer 0 — closed green shape
+
+- Green excess threshold
+- Green ratio threshold
+- Mask grow radius
+- Hole detection
+- Outline color and opacity
+- Weighted-center marker
+
+Layer 0 always selects the connected green component containing, or nearest to, the weighted center of all green evidence.
+
+### Special green-area transparency layer
+
+- overlay color
+- overlay opacity
+- optional output alpha mask
+- shape output alpha (`0` fully transparent, `255` opaque)
+
+The alpha mask is preserved when saving PNG. Detected holes remain outside the selected green mask.
+
+### Extra edge layers
+
+Each layer has:
+
+- low/high edge thresholds
+- threshold reduction near the green shape
+- reduction radius
+- color
+- opacity
+- independent enable/delete controls
+
+## Performance notes
+
+- Interactive changes are queued asynchronously.
+- Older jobs are cancelled or ignored when newer slider values arrive.
+- Edge layers are computed in parallel.
+- You can limit or increase CPU parallelism with:
+
+```bash
+RAYON_NUM_THREADS=8 cargo run --release -- image.jpg
+```

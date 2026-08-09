@@ -1,5 +1,5 @@
 {
-  description = "Rust egui Canny edge detector development environment";
+  description = "Rust egui/wgpu green-shape and edge composer";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -12,6 +12,7 @@
         pkgs = import nixpkgs { inherit system; };
 
         runtimeLibraries = with pkgs; [
+          vulkan-loader
           libGL
           libxkbcommon
           wayland
@@ -19,6 +20,10 @@
           xorg.libXcursor
           xorg.libXi
           xorg.libXrandr
+          xorg.libxcb
+          xorg.libXext
+          xorg.libXfixes
+          xorg.libXrender
         ];
       in
       {
@@ -31,13 +36,21 @@
             pkg-config
             dbus
             openssl
+            vulkan-loader
+            vulkan-tools
           ];
 
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibraries;
 
+          # wgpu normally selects Vulkan automatically on Linux. This makes the
+          # preferred backend explicit while still allowing WGPU_BACKEND to be
+          # overridden before entering the shell.
           shellHook = ''
-            echo "Rust egui edge detector"
+            export WGPU_BACKEND="''${WGPU_BACKEND:-vulkan}"
+            echo "Rust green-shape edge composer (egui + wgpu)"
+            echo "WGPU_BACKEND=$WGPU_BACKEND"
             echo "Run: cargo run --release -- /path/to/image.jpg"
+            echo "GPU check: vulkaninfo --summary"
           '';
         };
       });
