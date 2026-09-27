@@ -223,3 +223,22 @@ nix develop .#android
 The reconstruction `train.sh` now trains against held-out views until validation
 PSNR/LPIPS plateau. It prints loss and render-quality deltas, preserves the best
 checkpoint, and writes CSV/JSON statistics. See `reconstruction/README.md`.
+
+## Gaussian splatting
+
+Nerfacto is a neural radiance-field method. To train explicit 3D Gaussian
+splats, the project now includes Brush for AMD/Intel/NVIDIA WebGPU devices and
+Nerfstudio Splatfacto for CUDA GPUs.
+
+For the Radeon 780M:
+
+```bash
+nix develop .#gaussian
+cd reconstruction
+./gaussian/check-gaussian.sh
+./gaussian/setup-brush.sh
+./train-gaussian.sh plant_003 brush
+./gaussian/view-brush.sh plant_003
+```
+
+Full instructions: `reconstruction/gaussian/README.md`.

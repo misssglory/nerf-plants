@@ -1,5 +1,5 @@
 {
-  description = "Plant Capture: Android capture plus Nerfstudio reconstruction tools on NixOS";
+  description = "Plant Capture: Android capture, Nerfstudio and Gaussian reconstruction tools on NixOS";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -40,9 +40,6 @@
             JAVA_HOME = "${pkgs.jdk17}";
             ANDROID_HOME = sdkRoot;
             ANDROID_SDK_ROOT = sdkRoot;
-
-            # AGP normally downloads its own aapt2 binary. On NixOS it is
-            # safer to force the patched aapt2 supplied by androidenv.
             GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${sdkRoot}/build-tools/36.0.0/aapt2";
 
             shellHook = ''
@@ -54,10 +51,6 @@
             '';
           };
 
-          # Binary Python/Conda packages such as Open3D and COLMAP are built
-          # for conventional FHS Linux distributions. On NixOS their dynamic
-          # libraries are not in a global /usr/lib search path, so expose the
-          # common X11/OpenGL/runtime dependencies explicitly.
           reconstructionRuntimeLibraries = with pkgs; [
             stdenv.cc.cc.lib
             zlib
@@ -83,11 +76,6 @@
             xorg.libXdmcp
           ];
 
-          # Nerfstudio's own v1.1.5 Pixi environment pins Python 3.10,
-          # PyTorch 2.2, CUDA 11.8 and COLMAP 3.9.x. The flake supplies Pixi
-          # and host-side tools; reconstruction/pixi.toml supplies the Python
-          # and CUDA user-space stack. Video preprocessing itself is CPU-only;
-          # model training still normally requires a supported CUDA GPU.
           nerfstudioShell = pkgs.mkShell {
             packages = with pkgs; [
               pixi
@@ -111,32 +99,88 @@
               export PIXI_CACHE_DIR="''${PIXI_CACHE_DIR:-$HOME/.cache/rattler/cache}"
               export TORCH_EXTENSIONS_DIR="''${TORCH_EXTENSIONS_DIR:-$PROJECT_ROOT/.cache/torch_extensions}"
               mkdir -p "$PIXI_CACHE_DIR" "$TORCH_EXTENSIONS_DIR"
-
-              # Prebuilt Open3D/COLMAP wheels expect X11 and OpenGL libraries
-              # in a conventional global loader path. NixOS intentionally has
-              # no such /usr/lib path, so provide the exact Nix store paths.
-              # The /run/opengl-driver entries expose the active GPU driver
-              # when present; they are harmless on CPU-only preprocessing.
               export LD_LIBRARY_PATH="/run/opengl-driver/lib:/run/opengl-driver-32/lib:${pkgs.lib.makeLibraryPath reconstructionRuntimeLibraries}:''${LD_LIBRARY_PATH:-}"
 
               echo "Plant Capture Nerfstudio environment"
-              echo "Setup:   cd reconstruction && ./setup.sh"
-              echo "Process: cd reconstruction && ./process-video.sh VIDEO.mp4 NAME [FRAMES]"
-              echo "Check:   cd reconstruction && ./check-accelerator.sh"
-              echo "Train:   cd reconstruction && ./train.sh NAME nerfacto"
-              echo "Export:  cd reconstruction && ./export-mesh.sh PATH/TO/config.yml NAME"
+              echo "Setup:    cd reconstruction && ./setup.sh"
+              echo "Process:  cd reconstruction && ./process-video.sh VIDEO.mp4 NAME [FRAMES]"
+              echo "NeRF:     cd reconstruction && ./train.sh NAME nerfacto"
+              echo "Gaussian: cd reconstruction && ./train-gaussian.sh NAME splatfacto"
+              echo "Export:   cd reconstruction && ./export-mesh.sh PATH/TO/config.yml NAME"
               echo
               if command -v nvidia-smi >/dev/null 2>&1; then
                 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || true
               else
-                echo "WARNING: nvidia-smi is unavailable. Nerfstudio training normally requires an NVIDIA CUDA GPU."
+                echo "No NVIDIA CUDA driver detected. Use nix develop .#gaussian for AMD/Intel Brush training."
               fi
+            '';
+          };
+
+          gaussianRuntimeLibraries = reconstructionRuntimeLibraries ++ (with pkgs; [
+            vulkan-loader
+            vulkan-validation-layers
+            shaderc
+            udev
+            alsa-lib
+          ]);
+
+          # Brush uses wgpu/WebGPU rather than CUDA, so this shell works with
+          # AMD, Intel and NVIDIA Vulkan drivers. It also includes Pixi so the
+          # auto wrapper can still detect and dispatch to Splatfacto on CUDA.
+          gaussianShell = pkgs.mkShell {
+            packages = with pkgs; [
+              rustc
+              cargo
+              rustfmt
+              clippy
+              git
+              git-lfs
+              curl
+              jq
+              which
+              file
+              ffmpeg
+              pixi
+              pkg-config
+              cmake
+              ninja
+              llvmPackages.clang
+              llvmPackages.lld
+              vulkan-tools
+              vulkan-loader
+              vulkan-validation-layers
+              shaderc
+            ];
+
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            RUST_BACKTRACE = "1";
+            CARGO_NET_GIT_FETCH_WITH_CLI = "true";
+
+            shellHook = ''
+              export PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+              export PLANT_TOOLS_DIR="''${PLANT_TOOLS_DIR:-$PROJECT_ROOT/reconstruction/.tools}"
+              export CARGO_HOME="''${CARGO_HOME:-$HOME/.cargo}"
+              export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PLANT_TOOLS_DIR/cargo-target/brush}"
+              export WGPU_BACKEND="''${WGPU_BACKEND:-vulkan}"
+              export LD_LIBRARY_PATH="/run/opengl-driver/lib:/run/opengl-driver-32/lib:${pkgs.lib.makeLibraryPath gaussianRuntimeLibraries}:''${LD_LIBRARY_PATH:-}"
+              export VK_LAYER_PATH="/run/opengl-driver/share/vulkan/explicit_layer.d:${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d:''${VK_LAYER_PATH:-}"
+              mkdir -p "$PLANT_TOOLS_DIR" "$CARGO_TARGET_DIR"
+
+              echo "Plant Capture Gaussian environment (Brush/WebGPU)"
+              echo "GPU check: cd reconstruction && ./gaussian/check-gaussian.sh"
+              echo "Setup:     cd reconstruction && ./gaussian/setup-brush.sh"
+              echo "Train:     cd reconstruction && ./train-gaussian.sh NAME brush"
+              echo "View:      cd reconstruction && ./gaussian/view-brush.sh NAME"
+              echo
+              vulkaninfo --summary 2>/dev/null | sed -n '1,24p' || \
+                echo "WARNING: Vulkan is unavailable. Check /run/opengl-driver and your Mesa/AMD driver."
             '';
           };
         in
           {
             default = androidShell;
             android = androidShell;
+            gaussian = gaussianShell;
           }
           // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             nerfstudio = nerfstudioShell;

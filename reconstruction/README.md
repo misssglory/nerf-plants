@@ -209,3 +209,31 @@ PLANT_EARLY_STOP=0 PLANT_MAX_ITERATIONS=200 ./train.sh plant_001 nerfacto
 After changing `pixi.toml`, run `pixi install` once. The supervisor uses the
 TensorBoard event reader to observe Nerfstudio's `Train Loss`, `Eval Loss`, and
 all-image PSNR/SSIM/LPIPS metrics while training is running.
+
+## Gaussian splatting workflows
+
+Nerfacto is a NeRF, not Gaussian splatting. For explicit 3D Gaussians, this
+project now includes two backends:
+
+```bash
+# AMD/Intel/NVIDIA through Vulkan/WebGPU; recommended for Radeon 780M.
+nix develop .#gaussian
+cd reconstruction
+./gaussian/setup-brush.sh
+./train-gaussian.sh plant_003 brush
+
+# CUDA-only Nerfstudio Splatfacto.
+nix develop .#nerfstudio
+cd reconstruction
+./train-gaussian.sh plant_003 splatfacto
+```
+
+Use automatic backend selection with:
+
+```bash
+./train-gaussian.sh plant_003
+```
+
+See `reconstruction/gaussian/README.md` for memory controls, live viewing and
+export commands. Gaussian PLY files are visual radiance representations, not
+metric leaf meshes.

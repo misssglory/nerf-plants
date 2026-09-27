@@ -1,0 +1,373 @@
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@
+ const MAX_EDGE_THRESHOLD: f32 = 1140.0;
+ const MIN_SCALE: f32 = 0.10;
+ const MAX_SCALE: f32 = 8.0;
++
++#[derive(Clone)]
++struct PreviewState {
++    zoom: f32,
++    pan: egui::Vec2,
++    fit_to_window: bool,
++    open: bool,
++}
++
++impl Default for PreviewState {
++    fn default() -> Self {
++        Self {
++            zoom: 1.0,
++            pan: egui::Vec2::ZERO,
++            fit_to_window: true,
++            open: true,
++        }
++    }
++}
+@@
+-    original_scale: f32,
+-    composite_scale: f32,
++    original_view: PreviewState,
++    composite_view: PreviewState,
++    link_view_transforms: bool,
+@@
+-            worker: ProcessingWorker::spawn(),
++            worker: ProcessingWorker::spawn(),
+@@
+-            original_scale: 1.0,
+-            composite_scale: 1.0,
++            original_view: PreviewState::default(),
++            composite_view: PreviewState::default(),
++            link_view_transforms: false,
+@@
+-                self.original_scale = 1.0;
+-                self.composite_scale = 1.0;
++                self.original_view = PreviewState::default();
++                self.composite_view = PreviewState::default();
+@@
+-        if self.processing {
+-            ctx.request_repaint_after(Duration::from_millis(33));
+-        }
++        // Do not keep a permanent animation/repaint loop alive. While a job is
++        // active we use a low-frequency safety poll; once the final worker
++        // message is consumed there are no scheduled repaints and egui can
++        // sleep until the next OS/input event.
++        if self.processing {
++            ctx.request_repaint_after(Duration::from_millis(100));
++        }
+@@
+-        if ui.button("Sync both scales").clicked() {
+-            let scale = self
+-                .original_scale
+-                .max(self.composite_scale)
+-                .clamp(MIN_SCALE, MAX_SCALE);
+-            self.original_scale = scale;
+-            self.composite_scale = scale;
+-        }
++        ui.horizontal(|ui| {
++            ui.checkbox(&mut self.original_view.open, "Original window");
++            ui.checkbox(&mut self.composite_view.open, "Processed window");
++        });
++        ui.checkbox(
++            &mut self.link_view_transforms,
++            "Link zoom + pan between image windows",
++        );
+@@
+-        ui.collapsing("Preview scaling", |ui| {
+-            ui.small("Hover a preview and rotate the mouse wheel to zoom it.");
+-            ui.add(
+-                egui::Slider::new(&mut self.original_scale, MIN_SCALE..=MAX_SCALE)
+-                    .text("Original scale")
+-                    .fixed_decimals(2),
+-            );
+-            ui.add(
+-                egui::Slider::new(&mut self.composite_scale, MIN_SCALE..=MAX_SCALE)
+-                    .text("Overlay scale")
+-                    .fixed_decimals(2),
+-            );
++        ui.collapsing("Image window controls", |ui| {
++            ui.small("Drag image = pan. Two-finger touchpad scroll = pan. Pinch or Ctrl+wheel = zoom.");
++            ui.small("Fit follows the floating window size; 1:1 shows one image pixel per screen point.");
++            preview_scale_controls(ui, "Original", &mut self.original_view);
++            preview_scale_controls(ui, "Processed", &mut self.composite_view);
+         });
+@@
+-    fn previews(&mut self, ui: &mut egui::Ui) {
+-        ui.columns(2, |columns| {
+-            show_zoomable_texture(
+-                &mut columns[0],
+-                "Original",
+-                self.original_texture.as_ref(),
+-                &mut self.original_scale,
+-            );
+-            show_zoomable_texture(
+-                &mut columns[1],
+-                "Overlay / alpha composite",
+-                self.composite_texture.as_ref(),
+-                &mut self.composite_scale,
+-            );
+-        });
++    fn previews(&mut self, ctx: &egui::Context) {
++        let original_texture = self.original_texture.clone();
++        let composite_texture = self.composite_texture.clone();
++
++        let mut original_changed = false;
++        let mut composite_changed = false;
++
++        if self.original_view.open {
++            let mut open = self.original_view.open;
++            egui::Window::new("Original image")
++                .id(egui::Id::new("original-floating-preview"))
++                .open(&mut open)
++                .resizable(true)
++                .default_pos(egui::pos2(410.0, 70.0))
++                .default_size(egui::vec2(560.0, 650.0))
++                .min_size(egui::vec2(240.0, 180.0))
++                .show(ctx, |ui| {
++                    original_changed = show_image_viewer(
++                        ui,
++                        original_texture.as_ref(),
++                        &mut self.original_view,
++                    );
++                });
++            self.original_view.open = open;
++        }
++
++        if self.composite_view.open {
++            let mut open = self.composite_view.open;
++            egui::Window::new("Processed image")
++                .id(egui::Id::new("processed-floating-preview"))
++                .open(&mut open)
++                .resizable(true)
++                .default_pos(egui::pos2(990.0, 70.0))
++                .default_size(egui::vec2(560.0, 650.0))
++                .min_size(egui::vec2(240.0, 180.0))
++                .show(ctx, |ui| {
++                    composite_changed = show_image_viewer(
++                        ui,
++                        composite_texture.as_ref(),
++                        &mut self.composite_view,
++                    );
++                });
++            self.composite_view.open = open;
++        }
++
++        if self.link_view_transforms {
++            if original_changed && !composite_changed {
++                copy_view_transform(&self.original_view, &mut self.composite_view);
++            } else if composite_changed {
++                copy_view_transform(&self.composite_view, &mut self.original_view);
++            }
++        }
+     }
+ }
+@@
+-        egui::CentralPanel::default().show(ui, |ui| {
+-            self.previews(ui);
++        egui::CentralPanel::default().show(ui, |ui| {
++            ui.centered_and_justified(|ui| {
++                ui.label("Images are shown in movable, resizable floating windows. Use the controls on the left if a window is closed.");
++            });
+         });
++
++        self.previews(&ctx);
+     }
+ }
+@@
+-fn show_zoomable_texture(
+-    ui: &mut egui::Ui,
+-    title: &str,
+-    texture: Option<&egui::TextureHandle>,
+-    scale: &mut f32,
+-) {
+-    ui.heading(title);
+-    ui.separator();
+-
+-    let Some(texture) = texture else {
+-        ui.centered_and_justified(|ui| {
+-            ui.label("No image loaded");
+-        });
+-        return;
+-    };
+-
+-    egui::ScrollArea::both()
+-        .auto_shrink([false, false])
+-        .show(ui, |ui| {
+-            let display_size = texture.size_vec2() * *scale;
+-            let response = ui.add(
+-                egui::Image::new(texture)
+-                    .fit_to_exact_size(display_size)
+-                    .maintain_aspect_ratio(true),
+-            );
+-
+-            if response.hovered() {
+-                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+-                if scroll.abs() > f32::EPSILON {
+-                    let factor: f32 = if scroll > 0.0 { 1.10 } else { 1.0 / 1.10 };
+-                    let steps = (scroll.abs() / 32.0).max(1.0);
+-                    *scale = (*scale * factor.powf(steps)).clamp(MIN_SCALE, MAX_SCALE);
+-                }
+-            }
+-        });
+-
+-    ui.small(format!("Scale: {:.2}×", *scale));
+-}
++fn preview_scale_controls(ui: &mut egui::Ui, label: &str, state: &mut PreviewState) {
++    ui.horizontal(|ui| {
++        ui.strong(label);
++        if ui.small_button("−").clicked() {
++            state.fit_to_window = false;
++            state.zoom = (state.zoom / 1.25).clamp(MIN_SCALE, MAX_SCALE);
++        }
++        if ui.small_button("+").clicked() {
++            state.fit_to_window = false;
++            state.zoom = (state.zoom * 1.25).clamp(MIN_SCALE, MAX_SCALE);
++        }
++        if ui.small_button("Fit").clicked() {
++            state.fit_to_window = true;
++            state.pan = egui::Vec2::ZERO;
++        }
++        if ui.small_button("1:1").clicked() {
++            state.fit_to_window = false;
++            state.zoom = 1.0;
++            state.pan = egui::Vec2::ZERO;
++        }
++        if ui.small_button("Center").clicked() {
++            state.pan = egui::Vec2::ZERO;
++        }
++    });
++
++    let mut slider_zoom = state.zoom;
++    if ui
++        .add(
++            egui::Slider::new(&mut slider_zoom, MIN_SCALE..=MAX_SCALE)
++                .text("Zoom")
++                .logarithmic(true)
++                .fixed_decimals(2),
++        )
++        .changed()
++    {
++        state.fit_to_window = false;
++        state.zoom = slider_zoom;
++    }
++}
++
++fn copy_view_transform(source: &PreviewState, target: &mut PreviewState) {
++    target.zoom = source.zoom;
++    target.pan = source.pan;
++    target.fit_to_window = source.fit_to_window;
++}
++
++fn show_image_viewer(
++    ui: &mut egui::Ui,
++    texture: Option<&egui::TextureHandle>,
++    state: &mut PreviewState,
++) -> bool {
++    let Some(texture) = texture else {
++        ui.centered_and_justified(|ui| ui.label("No image loaded"));
++        return false;
++    };
++
++    ui.horizontal(|ui| {
++        if ui.small_button("−").clicked() {
++            state.fit_to_window = false;
++            state.zoom = (state.zoom / 1.25).clamp(MIN_SCALE, MAX_SCALE);
++        }
++        if ui.small_button("+").clicked() {
++            state.fit_to_window = false;
++            state.zoom = (state.zoom * 1.25).clamp(MIN_SCALE, MAX_SCALE);
++        }
++        if ui.small_button("Fit").clicked() {
++            state.fit_to_window = true;
++            state.pan = egui::Vec2::ZERO;
++        }
++        if ui.small_button("1:1").clicked() {
++            state.fit_to_window = false;
++            state.zoom = 1.0;
++            state.pan = egui::Vec2::ZERO;
++        }
++        if ui.small_button("Center").clicked() {
++            state.pan = egui::Vec2::ZERO;
++        }
++        ui.separator();
++        ui.label(if state.fit_to_window {
++            "Fit"
++        } else {
++            "Manual"
++        });
++    });
++
++    let before_zoom = state.zoom;
++    let before_pan = state.pan;
++    let before_fit = state.fit_to_window;
++
++    let canvas_size = ui.available_size().max(egui::vec2(80.0, 80.0));
++    let (canvas_rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::drag());
++    let texture_size = texture.size_vec2();
++
++    let fit_zoom = (canvas_rect.width() / texture_size.x)
++        .min(canvas_rect.height() / texture_size.y)
++        .clamp(MIN_SCALE, MAX_SCALE);
++
++    if state.fit_to_window {
++        state.zoom = fit_zoom;
++        state.pan = egui::Vec2::ZERO;
++    }
++
++    if response.dragged() {
++        state.fit_to_window = false;
++        state.pan += response.drag_delta();
++    }
++
++    if response.hovered() {
++        let (zoom_delta, scroll_delta, ctrl) = ui.input(|input| {
++            (
++                input.zoom_delta(),
++                input.smooth_scroll_delta,
++                input.modifiers.ctrl || input.modifiers.command,
++            )
++        });
++
++        // egui's zoom_delta includes touchpad pinch. Ctrl/Command + wheel is
++        // also interpreted as zoom by winit/egui on the major desktop stacks.
++        if (zoom_delta - 1.0).abs() > 0.001 {
++            let pointer = response.hover_pos().unwrap_or(canvas_rect.center());
++            let image_center = canvas_rect.center() + state.pan;
++            let old_zoom = state.zoom;
++            let new_zoom = (old_zoom * zoom_delta).clamp(MIN_SCALE, MAX_SCALE);
++            if (new_zoom - old_zoom).abs() > f32::EPSILON {
++                let relative = pointer - image_center;
++                state.pan -= relative * (new_zoom / old_zoom - 1.0);
++                state.zoom = new_zoom;
++                state.fit_to_window = false;
++            }
++        } else if ctrl && scroll_delta.y.abs() > 0.0 {
++            let factor = (scroll_delta.y * 0.0025).exp();
++            state.zoom = (state.zoom * factor).clamp(MIN_SCALE, MAX_SCALE);
++            state.fit_to_window = false;
++        } else if scroll_delta.length_sq() > 0.0 {
++            // Native-feeling two-finger touchpad pan / wheel pan.
++            state.fit_to_window = false;
++            state.pan += scroll_delta;
++        }
++    }
++
++    let display_size = texture_size * state.zoom;
++    let image_rect = egui::Rect::from_center_size(canvas_rect.center() + state.pan, display_size);
++    let painter = ui.painter().with_clip_rect(canvas_rect);
++    painter.rect_filled(canvas_rect, 0.0, egui::Color32::BLACK);
++    painter.image(
++        texture.id(),
++        image_rect,
++        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
++        egui::Color32::WHITE,
++    );
++
++    if response.hovered() {
++        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
++    }
++
++    response.on_hover_text("Drag to pan • two-finger scroll to pan • pinch/Ctrl+wheel to zoom");
++
++    before_zoom != state.zoom || before_pan != state.pan || before_fit != state.fit_to_window
++}
