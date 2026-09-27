@@ -1,5 +1,5 @@
 {
-  description = "rust-edge-gui development shell";
+  description = "rust-egui-viewer development shell";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -40,7 +40,7 @@
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibraries;
           shellHook = ''
             export WGPU_BACKEND="''${WGPU_BACKEND:-vulkan}"
-            echo "rust-edge-gui"
+            echo "rust-egui-viewer"
             echo "Run: cargo run --release"
           '';
         };

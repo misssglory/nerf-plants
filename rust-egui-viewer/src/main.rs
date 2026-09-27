@@ -13,7 +13,7 @@ use image::{DynamicImage, GrayImage, Rgba, RgbaImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-const APP_TITLE: &str = "Rust Edge GUI — Green Shape + Edge Composer";
+const APP_TITLE: &str = "Rust Egui Viewer — Green Shapes";
 const MAX_HISTORY: usize = 20;
 
 fn main() -> eframe::Result {
@@ -249,7 +249,7 @@ impl GreenViewerApp {
             shape_count: 0,
             green_pixels: 0,
             boundary_pixels: 0,
-            status: "Open an image from disk or enter a camera IP/address.".to_owned(),
+            status: "Open an image from disk or enter an image URL.".to_owned(),
             error: None,
             original_view: viewer::ImageViewState::default(),
             processed_view: viewer::ImageViewState::default(),
@@ -261,15 +261,7 @@ impl GreenViewerApp {
                 app.url_input = source.clone();
                 app.queue_source(SourceRequest::Url(source));
             } else {
-                let path = PathBuf::from(&source);
-                if path.exists() {
-                    app.queue_source(SourceRequest::File(path));
-                } else if let Ok(url) = normalize_camera_address(&source) {
-                    app.url_input = source;
-                    app.queue_source(SourceRequest::Url(url));
-                } else {
-                    app.queue_source(SourceRequest::File(path));
-                }
+                app.queue_source(SourceRequest::File(PathBuf::from(source)));
             }
         }
 
@@ -326,7 +318,7 @@ impl GreenViewerApp {
         self.source_label = image.label.clone();
         self.original_view.reset_fit();
         self.processed_view.reset_fit();
-        self.status = format!("Loaded {}; processing…", image.label);
+        self.status = format!("Loaded {}", image.label);
         self.error = None;
         self.remember_source(image.label);
         self.schedule_processing();
@@ -435,39 +427,12 @@ impl GreenViewerApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Rust Edge GUI");
-        ui.small("Disk or camera IP input → automatic green-shape processing.");
+        ui.heading("Green-shape image viewer");
+        ui.small("Disk + HTTP input, asynchronous green detection, idle-safe repainting.");
         ui.separator();
 
-        ui.label("Camera IP / address");
-        let url_response = ui.add(
-            egui::TextEdit::singleline(&mut self.url_input)
-                .hint_text("10.87.121.137   or   http://10.87.121.137"),
-        );
-        let enter = url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let load_camera = ui
-            .add_enabled(!self.source_loading, egui::Button::new("Load camera + process"))
-            .clicked()
-            || enter;
-        if load_camera && !self.url_input.trim().is_empty() {
-            let address = self.url_input.trim().to_owned();
-            match normalize_camera_address(&address) {
-                Ok(url) => {
-                    self.url_input = address;
-                    self.queue_source(SourceRequest::Url(url));
-                }
-                Err(error) => {
-                    self.error = Some(format!("Invalid camera address: {error:#}"));
-                }
-            }
-        }
-        ui.small(
-            "A plain IP is enough. The app tries http://IP first; if that is not an image, /capture is tried as a fallback. Every loaded frame is processed automatically.",
-        );
-
-        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button("Open image from disk…").clicked() {
+            if ui.button("Open image…").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Open image")
                     .add_filter(
@@ -488,8 +453,17 @@ impl GreenViewerApp {
             }
         });
 
+        ui.add_space(4.0);
+        ui.label("Network image URL");
+        let url_response = ui.text_edit_singleline(&mut self.url_input);
+        let enter = url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (ui.button("Load URL").clicked() || enter) && !self.url_input.trim().is_empty() {
+            self.queue_source(SourceRequest::Url(self.url_input.trim().to_owned()));
+        }
+        ui.small("The URL must return image bytes directly (JPEG/PNG/WebP/etc.).");
+
         if !self.source_history.is_empty() {
-            ui.collapsing("Input history", |ui| {
+            ui.collapsing("Source history", |ui| {
                 let history = self.source_history.clone();
                 for source in history {
                     if ui.selectable_label(false, &source).clicked() {
@@ -497,15 +471,7 @@ impl GreenViewerApp {
                             self.url_input = source.clone();
                             self.queue_source(SourceRequest::Url(source));
                         } else {
-                            let path = PathBuf::from(&source);
-                            if path.exists() {
-                                self.queue_source(SourceRequest::File(path));
-                            } else if let Ok(url) = normalize_camera_address(&source) {
-                                self.url_input = source.clone();
-                                self.queue_source(SourceRequest::Url(url));
-                            } else {
-                                self.queue_source(SourceRequest::File(path));
-                            }
+                            self.queue_source(SourceRequest::File(PathBuf::from(source)));
                         }
                     }
                 }
@@ -749,8 +715,8 @@ fn source_loop(
 ) {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.4")
+        .timeout(Duration::from_secs(15))
+        .user_agent("rust-egui-viewer/0.3")
         .build()
         .expect("failed to build HTTP client");
 
@@ -795,101 +761,25 @@ fn load_file_source(path: &Path) -> Result<LoadedImage> {
     })
 }
 
-fn normalize_camera_address(input: &str) -> Result<String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("camera address is empty"));
-    }
-
-    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_owned()
-    } else {
-        format!("http://{trimmed}")
-    };
-
-    let parsed = reqwest::Url::parse(&candidate)
-        .with_context(|| format!("cannot parse {candidate}"))?;
-    if parsed.host_str().is_none() {
-        return Err(anyhow!("camera address has no host"));
-    }
-    Ok(parsed.to_string())
-}
-
-fn camera_url_candidates(url: &str) -> Result<Vec<String>> {
-    let parsed = reqwest::Url::parse(url)
-        .with_context(|| format!("cannot parse camera URL {url}"))?;
-    let mut candidates = vec![parsed.to_string()];
-
-    let path = parsed.path();
-    if path.is_empty() || path == "/" {
-        let mut capture = parsed.clone();
-        capture.set_path("/capture");
-        capture.set_query(None);
-        let capture = capture.to_string();
-        if !candidates.iter().any(|candidate| candidate == &capture) {
-            candidates.push(capture);
-        }
-    }
-
-    Ok(candidates)
-}
-
-fn fetch_single_image(client: &reqwest::blocking::Client, url: &str) -> Result<LoadedImage> {
+fn load_url_source(client: &reqwest::blocking::Client, url: &str) -> Result<LoadedImage> {
     let response = client
         .get(url)
-        .header(reqwest::header::ACCEPT, "image/*,*/*;q=0.8")
         .send()
         .with_context(|| format!("request failed for {url}"))?
         .error_for_status()
         .with_context(|| format!("HTTP error for {url}"))?;
 
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if content_type.starts_with("text/html") {
-        return Err(anyhow!("{url} returned an HTML page, not an image"));
-    }
-    if content_type.starts_with("multipart/") {
-        return Err(anyhow!("{url} returned a multipart stream, not a single snapshot"));
-    }
-
-    // `bytes()` drains the whole response before decoding. This avoids decoding a
-    // partially received high-resolution JPEG as only its upper section.
-    let bytes = response
-        .bytes()
-        .with_context(|| format!("failed while reading the complete image from {url}"))?;
+    let bytes = response.bytes().context("failed reading HTTP response body")?;
     if bytes.is_empty() {
-        return Err(anyhow!("{url} returned an empty response"));
+        return Err(anyhow!("server returned an empty response"));
     }
-
     let decoded = image::load_from_memory(&bytes)
-        .with_context(|| format!("response from {url} is not a complete supported image"))?;
+        .with_context(|| "response is not a supported image; enter the direct image endpoint")?;
     Ok(LoadedImage {
         label: url.to_owned(),
         rgba: decoded.to_rgba8(),
         gray: decoded.to_luma8(),
     })
-}
-
-fn load_url_source(client: &reqwest::blocking::Client, url: &str) -> Result<LoadedImage> {
-    let candidates = camera_url_candidates(url)?;
-    let mut errors = Vec::new();
-
-    for candidate in &candidates {
-        match fetch_single_image(client, candidate) {
-            Ok(image) => return Ok(image),
-            Err(error) => errors.push(format!("{candidate}: {error:#}")),
-        }
-    }
-
-    Err(anyhow!(
-        "camera did not return a decodable image. Tried:\n{}",
-        errors.join("\n")
-    ))
 }
 
 fn processing_loop(
