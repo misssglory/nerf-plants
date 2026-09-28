@@ -20,7 +20,7 @@ use yolo::{
     YoloRuntimeSettings, YoloWorker,
 };
 
-const APP_TITLE: &str = "Rust Edge GUI v0.7 — Sequence Tracking + YOLO Segmentation";
+const APP_TITLE: &str = "Rust Edge GUI v0.7.1 — Live Sequences + Persistent UI";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -71,7 +71,9 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        persist_window: true,
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("rust-edge-gui")
             .with_inner_size([1500.0, 940.0])
             .with_min_inner_size([980.0, 700.0])
             .with_drag_and_drop(true),
@@ -251,8 +253,134 @@ impl SourceWorker {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedGreenSettings {
+    green_excess_threshold: f32,
+    green_ratio_threshold: f32,
+    blue_deficit_threshold: f32,
+    plant_index_threshold: f32,
+    min_green_red_ratio: f32,
+    min_rg_brightness: f32,
+    hybrid_color_expand: u32,
+    min_component_area: usize,
+    grow_radius: u32,
+    fill_color: [u8; 4],
+    fill_opacity: u8,
+    outline_color: [u8; 4],
+    outline_opacity: u8,
+    dimness: f32,
+    edge_enabled: bool,
+    edge_threshold: f32,
+    edge_color: [u8; 4],
+    edge_opacity: u8,
+}
+
+impl PersistedGreenSettings {
+    fn from_settings(settings: &GreenSettings) -> Self {
+        Self {
+            green_excess_threshold: settings.green_excess_threshold,
+            green_ratio_threshold: settings.green_ratio_threshold,
+            blue_deficit_threshold: settings.blue_deficit_threshold,
+            plant_index_threshold: settings.plant_index_threshold,
+            min_green_red_ratio: settings.min_green_red_ratio,
+            min_rg_brightness: settings.min_rg_brightness,
+            hybrid_color_expand: settings.hybrid_color_expand,
+            min_component_area: settings.min_component_area,
+            grow_radius: settings.grow_radius,
+            fill_color: settings.fill_color.to_array(),
+            fill_opacity: settings.fill_opacity,
+            outline_color: settings.outline_color.to_array(),
+            outline_opacity: settings.outline_opacity,
+            dimness: settings.dimness,
+            edge_enabled: settings.edge_enabled,
+            edge_threshold: settings.edge_threshold,
+            edge_color: settings.edge_color.to_array(),
+            edge_opacity: settings.edge_opacity,
+        }
+    }
+
+    fn into_settings(self) -> GreenSettings {
+        GreenSettings {
+            green_excess_threshold: self.green_excess_threshold,
+            green_ratio_threshold: self.green_ratio_threshold,
+            blue_deficit_threshold: self.blue_deficit_threshold,
+            plant_index_threshold: self.plant_index_threshold,
+            min_green_red_ratio: self.min_green_red_ratio,
+            min_rg_brightness: self.min_rg_brightness,
+            hybrid_color_expand: self.hybrid_color_expand,
+            min_component_area: self.min_component_area,
+            grow_radius: self.grow_radius,
+            fill_color: egui::Color32::from_rgba_unmultiplied(
+                self.fill_color[0], self.fill_color[1], self.fill_color[2], self.fill_color[3],
+            ),
+            fill_opacity: self.fill_opacity,
+            outline_color: egui::Color32::from_rgba_unmultiplied(
+                self.outline_color[0], self.outline_color[1], self.outline_color[2], self.outline_color[3],
+            ),
+            outline_opacity: self.outline_opacity,
+            dimness: self.dimness,
+            edge_enabled: self.edge_enabled,
+            edge_threshold: self.edge_threshold,
+            edge_color: egui::Color32::from_rgba_unmultiplied(
+                self.edge_color[0], self.edge_color[1], self.edge_color[2], self.edge_color[3],
+            ),
+            edge_opacity: self.edge_opacity,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedViewState {
+    open: bool,
+    zoom: f32,
+    pan: [f32; 2],
+    fit_to_window: bool,
+    window_pos: Option<[f32; 2]>,
+    window_size: Option<[f32; 2]>,
+}
+
+impl PersistedViewState {
+    fn from_view(view: &viewer::ImageViewState) -> Self {
+        Self {
+            open: view.open,
+            zoom: view.zoom,
+            pan: [view.pan.x, view.pan.y],
+            fit_to_window: view.fit_to_window,
+            window_pos: view.window_pos.map(|p| [p.x, p.y]),
+            window_size: view.window_size.map(|v| [v.x, v.y]),
+        }
+    }
+
+    fn into_view(self) -> viewer::ImageViewState {
+        viewer::ImageViewState {
+            open: self.open,
+            zoom: self.zoom.clamp(viewer::MIN_ZOOM, viewer::MAX_ZOOM),
+            pan: egui::vec2(self.pan[0], self.pan[1]),
+            fit_to_window: self.fit_to_window,
+            window_pos: self.window_pos.map(|p| egui::pos2(p[0], p[1])),
+            window_size: self.window_size.map(|v| egui::vec2(v[0].max(300.0), v[1].max(240.0))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct PersistedWindowRect {
+    pos: [f32; 2],
+    size: [f32; 2],
+}
+
+impl PersistedWindowRect {
+    fn new(pos: egui::Pos2, size: egui::Vec2) -> Self {
+        Self { pos: [pos.x, pos.y], size: [size.x, size.y] }
+    }
+    fn pos(self) -> egui::Pos2 { egui::pos2(self.pos[0], self.pos[1]) }
+    fn size(self) -> egui::Vec2 { egui::vec2(self.size[0], self.size[1]) }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct PersistedState {
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     source_history: Vec<String>,
     #[serde(default)]
@@ -275,6 +403,67 @@ struct PersistedState {
     yolo_mask_threshold: f32,
     #[serde(default)]
     yolo_input_size: usize,
+
+    #[serde(default)]
+    green_settings: Option<PersistedGreenSettings>,
+    #[serde(default)]
+    update_while_dragging: bool,
+    #[serde(default)]
+    yolo_device: String,
+    #[serde(default)]
+    yolo_fallback_color: bool,
+    #[serde(default)]
+    temporal_filter_enabled: bool,
+    #[serde(default)]
+    temporal_window_frames: usize,
+    #[serde(default)]
+    temporal_required_frames: usize,
+    #[serde(default)]
+    temporal_overlap_threshold: f32,
+    #[serde(default)]
+    track_overlap_threshold: f32,
+    #[serde(default)]
+    sequence_playback_fps: f32,
+    #[serde(default)]
+    sequence_loop: bool,
+    #[serde(default)]
+    sequence_wait_processing: bool,
+    #[serde(default)]
+    capture_save_original: bool,
+    #[serde(default)]
+    capture_save_processed: bool,
+    #[serde(default)]
+    original_view: Option<PersistedViewState>,
+    #[serde(default)]
+    processed_view: Option<PersistedViewState>,
+    #[serde(default)]
+    ai_view: Option<PersistedViewState>,
+    #[serde(default)]
+    controls_window: Option<PersistedWindowRect>,
+    #[serde(default)]
+    shape_plot_window: Option<PersistedWindowRect>,
+    #[serde(default)]
+    shape_plot_open: bool,
+    #[serde(default)]
+    url_input: String,
+    #[serde(default)]
+    image_history_input: String,
+    #[serde(default)]
+    sequence_history_input: String,
+    #[serde(default)]
+    sequence_glue_inputs: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SequenceManifest {
+    version: u32,
+    frames: Vec<SequenceManifestFrame>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SequenceManifestFrame {
+    path: String,
+    timestamp_ms: u64,
 }
 
 #[derive(Clone)]
@@ -330,6 +519,7 @@ struct PendingCapture {
     processing_job_id: Option<u64>,
     file_name: String,
     captured_at: SystemTime,
+    sequence_frame_index: Option<usize>,
 }
 
 struct GreenViewerApp {
@@ -408,6 +598,14 @@ struct GreenViewerApp {
     sequence_loop: bool,
     sequence_wait_processing: bool,
     next_sequence_frame_due: Option<Instant>,
+    sequence_glue_inputs: Vec<String>,
+
+    controls_window_pos: egui::Pos2,
+    controls_window_size: egui::Vec2,
+    shape_plot_window_pos: egui::Pos2,
+    shape_plot_window_size: egui::Vec2,
+    next_preferences_save: Instant,
+    preferences_dirty: bool,
 
     continuous_capture: bool,
     capture_interval_secs: f32,
@@ -424,8 +622,17 @@ impl GreenViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_source: Option<String>) -> Self {
         configure_dark_ui(&cc.egui_ctx);
         let persisted = load_persisted_state();
-        let image_history_input = persisted.source_history.first().cloned().unwrap_or_default();
-        let sequence_history_input = persisted.sequence_history.first().cloned().unwrap_or_default();
+        let persisted_v2 = persisted.version >= 2;
+        let image_history_input = if persisted_v2 && !persisted.image_history_input.is_empty() {
+            persisted.image_history_input.clone()
+        } else {
+            persisted.source_history.first().cloned().unwrap_or_default()
+        };
+        let sequence_history_input = if persisted_v2 && !persisted.sequence_history_input.is_empty() {
+            persisted.sequence_history_input.clone()
+        } else {
+            persisted.sequence_history.first().cloned().unwrap_or_default()
+        };
         let capture_base_dir_input = if persisted.capture_base_dir.trim().is_empty() {
             default_capture_base_dir().display().to_string()
         } else {
@@ -466,6 +673,33 @@ impl GreenViewerApp {
             320 | 512 | 640 | 768 | 1024 | 1280 => persisted.yolo_input_size,
             _ => 640,
         };
+        let settings = if persisted_v2 {
+            persisted.green_settings.clone().map(PersistedGreenSettings::into_settings).unwrap_or_default()
+        } else {
+            GreenSettings::default()
+        };
+        let original_view = if persisted_v2 {
+            persisted.original_view.clone().map(PersistedViewState::into_view).unwrap_or_default()
+        } else {
+            viewer::ImageViewState::default()
+        };
+        let processed_view = if persisted_v2 {
+            persisted.processed_view.clone().map(PersistedViewState::into_view).unwrap_or_default()
+        } else {
+            viewer::ImageViewState::default()
+        };
+        let ai_view = if persisted_v2 {
+            persisted.ai_view.clone().map(PersistedViewState::into_view).unwrap_or_else(|| viewer::ImageViewState { open: false, ..Default::default() })
+        } else {
+            viewer::ImageViewState { open: false, ..Default::default() }
+        };
+        let controls_window = persisted.controls_window.unwrap_or(PersistedWindowRect::new(egui::pos2(12.0, 24.0), egui::vec2(430.0, 850.0)));
+        let shape_plot_window = persisted.shape_plot_window.unwrap_or(PersistedWindowRect::new(egui::pos2(720.0, 80.0), egui::vec2(680.0, 360.0)));
+        let temporal_window_frames = if persisted_v2 { persisted.temporal_window_frames.clamp(4, 26) } else { 6 };
+        let temporal_radius = (temporal_window_frames / 2).saturating_sub(1).max(1);
+        let temporal_required_frames = if persisted_v2 {
+            persisted.temporal_required_frames.clamp(1, temporal_radius * 2)
+        } else { 1 };
 
         let mut app = Self {
             original_rgba: None,
@@ -474,7 +708,7 @@ impl GreenViewerApp {
             processed_rgba: None,
             processed_texture: None,
             source_label: "No image".to_owned(),
-            url_input: String::new(),
+            url_input: if persisted_v2 { persisted.url_input.clone() } else { String::new() },
             source_history: persisted.source_history,
             image_history_input,
             sequence_history: persisted.sequence_history,
@@ -484,10 +718,10 @@ impl GreenViewerApp {
             next_source_id: 0,
             active_source_id: 0,
             source_loading: false,
-            settings: GreenSettings::default(),
+            settings,
             detection_mode,
             dirty: false,
-            update_while_dragging: true,
+            update_while_dragging: if persisted_v2 { persisted.update_while_dragging } else { true },
             processing_worker: ProcessingWorker::spawn(cc.egui_ctx.clone()),
             yolo_worker: YoloWorker::spawn(cc.egui_ctx.clone()),
             next_job_id: 0,
@@ -501,19 +735,16 @@ impl GreenViewerApp {
             ai_mask: None,
             ai_mask_rgba: None,
             ai_mask_texture: None,
-            ai_view: viewer::ImageViewState {
-                open: false,
-                ..Default::default()
-            },
+            ai_view,
             yolo_model_path_input,
             yolo_class_ids_input,
             yolo_confidence,
             yolo_iou,
             yolo_mask_threshold,
             yolo_input_size,
-            yolo_device: YoloDevice::Auto,
+            yolo_device: if persisted_v2 && persisted.yolo_device == "cpu" { YoloDevice::Cpu } else { YoloDevice::Auto },
             yolo_model_generation: 0,
-            yolo_fallback_color: true,
+            yolo_fallback_color: if persisted_v2 { persisted.yolo_fallback_color } else { true },
             yolo_model_info: None,
             yolo_instance_count: 0,
             yolo_mask_pixels: 0,
@@ -521,30 +752,37 @@ impl GreenViewerApp {
             yolo_summary: "No YOLO inference yet".to_owned(),
             status: "Open an image from disk or enter a camera IP/address.".to_owned(),
             error: None,
-            original_view: viewer::ImageViewState::default(),
-            processed_view: viewer::ImageViewState::default(),
+            original_view,
+            processed_view,
             current_final_mask: None,
             active_processing_sequence_frame: None,
             sequence_mask_cache: BTreeMap::new(),
             sequence_mask_cache_order: VecDeque::new(),
-            temporal_filter_enabled: false,
-            temporal_lookahead_frames: 2,
-            temporal_required_frames: 1,
-            temporal_overlap_threshold: 0.35,
-            track_overlap_threshold: 0.30,
+            temporal_filter_enabled: if persisted_v2 { persisted.temporal_filter_enabled } else { false },
+            temporal_lookahead_frames: temporal_window_frames,
+            temporal_required_frames,
+            temporal_overlap_threshold: if persisted_v2 { persisted.temporal_overlap_threshold.clamp(0.0, 1.0) } else { 0.35 },
+            track_overlap_threshold: if persisted_v2 { persisted.track_overlap_threshold.clamp(0.0, 1.0) } else { 0.30 },
             shape_tracks: Vec::new(),
             next_track_id: 0,
-            shape_plot_open: false,
+            shape_plot_open: if persisted_v2 { persisted.shape_plot_open } else { false },
             sequence_playing: false,
-            sequence_playback_fps: 5.0,
-            sequence_loop: true,
-            sequence_wait_processing: true,
+            sequence_playback_fps: if persisted_v2 { persisted.sequence_playback_fps.clamp(0.1, 120.0) } else { 5.0 },
+            sequence_loop: if persisted_v2 { persisted.sequence_loop } else { true },
+            sequence_wait_processing: if persisted_v2 { persisted.sequence_wait_processing } else { true },
             next_sequence_frame_due: None,
+            sequence_glue_inputs: if persisted_v2 { persisted.sequence_glue_inputs.clone() } else { Vec::new() },
+            controls_window_pos: controls_window.pos(),
+            controls_window_size: controls_window.size(),
+            shape_plot_window_pos: shape_plot_window.pos(),
+            shape_plot_window_size: shape_plot_window.size(),
+            next_preferences_save: Instant::now() + Duration::from_secs(1),
+            preferences_dirty: false,
             continuous_capture: false,
             capture_interval_secs,
             capture_base_dir_input,
-            capture_save_original: true,
-            capture_save_processed: true,
+            capture_save_original: if persisted_v2 { persisted.capture_save_original } else { true },
+            capture_save_processed: if persisted_v2 { persisted.capture_save_processed } else { true },
             capture_url: None,
             capture_session: None,
             pending_capture: None,
@@ -573,12 +811,12 @@ impl GreenViewerApp {
 
     fn queue_source(&mut self, request: SourceRequest) {
         let is_capture = matches!(&request, SourceRequest::CaptureUrl(_));
-        if matches!(&request, SourceRequest::SequenceFrame(_)) {
+        if matches!(&request, SourceRequest::SequenceFrame(_) | SourceRequest::CaptureUrl(_)) {
             self.current_final_mask = None;
         }
         if matches!(
             &request,
-            SourceRequest::File(_) | SourceRequest::Url(_) | SourceRequest::CaptureUrl(_)
+            SourceRequest::File(_) | SourceRequest::Url(_)
         ) {
             self.active_sequence = None;
             self.sequence_playing = false;
@@ -645,6 +883,7 @@ impl GreenViewerApp {
                         .as_ref()
                         .is_some_and(|pending| pending.source_id == id)
                     {
+                        self.remove_pending_capture_sequence_frame();
                         self.pending_capture = None;
                     }
                     self.error = Some(error);
@@ -702,6 +941,7 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
+            version: 2,
             source_history: self.source_history.clone(),
             sequence_history: self.sequence_history.clone(),
             capture_base_dir: self.capture_base_dir_input.clone(),
@@ -713,7 +953,46 @@ impl GreenViewerApp {
             yolo_iou: self.yolo_iou,
             yolo_mask_threshold: self.yolo_mask_threshold,
             yolo_input_size: self.yolo_input_size,
+            green_settings: Some(PersistedGreenSettings::from_settings(&self.settings)),
+            update_while_dragging: self.update_while_dragging,
+            yolo_device: match self.yolo_device { YoloDevice::Cpu => "cpu", YoloDevice::Auto => "auto" }.to_owned(),
+            yolo_fallback_color: self.yolo_fallback_color,
+            temporal_filter_enabled: self.temporal_filter_enabled,
+            temporal_window_frames: self.temporal_lookahead_frames,
+            temporal_required_frames: self.temporal_required_frames,
+            temporal_overlap_threshold: self.temporal_overlap_threshold,
+            track_overlap_threshold: self.track_overlap_threshold,
+            sequence_playback_fps: self.sequence_playback_fps,
+            sequence_loop: self.sequence_loop,
+            sequence_wait_processing: self.sequence_wait_processing,
+            capture_save_original: self.capture_save_original,
+            capture_save_processed: self.capture_save_processed,
+            original_view: Some(PersistedViewState::from_view(&self.original_view)),
+            processed_view: Some(PersistedViewState::from_view(&self.processed_view)),
+            ai_view: Some(PersistedViewState::from_view(&self.ai_view)),
+            controls_window: Some(PersistedWindowRect::new(self.controls_window_pos, self.controls_window_size)),
+            shape_plot_window: Some(PersistedWindowRect::new(self.shape_plot_window_pos, self.shape_plot_window_size)),
+            shape_plot_open: self.shape_plot_open,
+            url_input: self.url_input.clone(),
+            image_history_input: self.image_history_input.clone(),
+            sequence_history_input: self.sequence_history_input.clone(),
+            sequence_glue_inputs: self.sequence_glue_inputs.clone(),
         });
+    }
+
+    fn tick_preference_persistence(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if ctx.input(|input| !input.events.is_empty()) {
+            self.preferences_dirty = true;
+            self.next_preferences_save = now + Duration::from_secs(1);
+        }
+        if self.preferences_dirty && now >= self.next_preferences_save {
+            self.save_preferences();
+            self.preferences_dirty = false;
+        }
+        if self.preferences_dirty && self.next_preferences_save > now {
+            ctx.request_repaint_after((self.next_preferences_save - now).min(Duration::from_secs(1)));
+        }
     }
 
     fn open_image_from_history_field(&mut self) {
@@ -775,6 +1054,89 @@ impl GreenViewerApp {
         }
     }
 
+    fn add_sequence_glue_input(&mut self, path: PathBuf) {
+        let value = path.display().to_string();
+        if !self.sequence_glue_inputs.iter().any(|entry| entry == &value) {
+            self.sequence_glue_inputs.push(value);
+            self.save_preferences();
+        }
+    }
+
+    fn glue_sequences(&mut self) {
+        if self.sequence_glue_inputs.len() < 2 {
+            self.error = Some("Add at least two sequence folders to glue.".to_owned());
+            return;
+        }
+        let Some(parent) = rfd::FileDialog::new()
+            .set_title("Choose destination for glued sequence")
+            .pick_folder()
+        else {
+            return;
+        };
+
+        let stamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+        let root = parent.join(format!("glued_sequence_{stamp}"));
+        let original_dir = root.join("original");
+        if let Err(error) = std::fs::create_dir_all(&original_dir) {
+            self.error = Some(format!("Failed to create {}: {error}", original_dir.display()));
+            return;
+        }
+
+        let inputs = self.sequence_glue_inputs.clone();
+        let result = (|| -> Result<usize> {
+            let mut manifest_frames = Vec::new();
+            let mut output_index = 1usize;
+            for input in inputs {
+                let sequence = load_image_sequence(Path::new(&input))
+                    .with_context(|| format!("cannot load glue input {input}"))?;
+                for frame in sequence.frames {
+                    let extension = frame
+                        .path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("png")
+                        .to_ascii_lowercase();
+                    let file_name = format!("frame_{output_index:08}.{extension}");
+                    let destination = original_dir.join(&file_name);
+                    std::fs::copy(&frame.path, &destination).with_context(|| {
+                        format!("cannot copy {} to {}", frame.path.display(), destination.display())
+                    })?;
+                    let timestamp_ms = frame
+                        .timestamp
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64;
+                    manifest_frames.push(SequenceManifestFrame {
+                        path: format!("original/{file_name}"),
+                        timestamp_ms,
+                    });
+                    output_index = output_index.saturating_add(1);
+                }
+            }
+            let frame_count = manifest_frames.len();
+            let manifest = SequenceManifest { version: 1, frames: manifest_frames };
+            let json = serde_json::to_vec_pretty(&manifest)?;
+            std::fs::write(root.join("sequence.json"), json)
+                .with_context(|| format!("cannot write {}/sequence.json", root.display()))?;
+            Ok(frame_count)
+        })();
+
+        match result {
+            Ok(frame_count) => {
+                self.error = None;
+                self.open_sequence(root.clone());
+                if self.active_sequence.as_ref().is_some_and(|sequence| sequence.root == root) {
+                    self.status = format!("Glued {frame_count} frame(s) into {} and opened it", root.display());
+                }
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&root);
+                self.error = Some(format!("Failed to glue sequences: {error:#}"));
+            }
+        }
+    }
+
     fn start_continuous_capture(&mut self) {
         if !self.capture_save_original && !self.capture_save_processed {
             self.error = Some("Enable original and/or processed capture saving first.".to_owned());
@@ -829,6 +1191,18 @@ impl GreenViewerApp {
             processed_dir,
             next_frame_index: 1,
         });
+        self.active_sequence = Some(ImageSequence {
+            root: root.clone(),
+            frames: Vec::new(),
+            selected: 0,
+        });
+        self.sequence_playing = false;
+        self.next_sequence_frame_due = None;
+        self.current_final_mask = None;
+        self.active_processing_sequence_frame = None;
+        self.sequence_mask_cache.clear();
+        self.sequence_mask_cache_order.clear();
+        self.shape_tracks.clear();
         self.capture_url = Some(url);
         self.pending_capture = None;
         self.next_capture_due = Some(Instant::now());
@@ -876,19 +1250,43 @@ impl GreenViewerApp {
                 self.stop_continuous_capture();
                 return;
             };
-            let Some(session) = self.capture_session.as_mut() else {
-                self.stop_continuous_capture();
-                return;
-            };
-
             let captured_at = SystemTime::now();
             let timestamp: DateTime<Local> = captured_at.into();
-            let file_name = format!(
-                "frame_{:06}_{}.png",
-                session.next_frame_index,
-                timestamp.format("%Y%m%d_%H%M%S_%3f")
-            );
-            session.next_frame_index = session.next_frame_index.saturating_add(1);
+            let (file_name, frame_path, session_root) = {
+                let Some(session) = self.capture_session.as_mut() else {
+                    self.stop_continuous_capture();
+                    return;
+                };
+                let file_name = format!(
+                    "frame_{:06}_{}.png",
+                    session.next_frame_index,
+                    timestamp.format("%Y%m%d_%H%M%S_%3f")
+                );
+                session.next_frame_index = session.next_frame_index.saturating_add(1);
+                let frame_path = if self.capture_save_original {
+                    session.original_dir.join(&file_name)
+                } else {
+                    session.processed_dir.join(&file_name)
+                };
+                (file_name, frame_path, session.root.clone())
+            };
+
+            if self
+                .active_sequence
+                .as_ref()
+                .is_none_or(|sequence| sequence.root != session_root)
+            {
+                self.active_sequence = Some(ImageSequence {
+                    root: session_root.clone(),
+                    frames: Vec::new(),
+                    selected: 0,
+                });
+            }
+            let sequence_frame_index = self.active_sequence.as_mut().map(|sequence| {
+                sequence.frames.push(SequenceFrame { path: frame_path, timestamp: captured_at });
+                sequence.selected = sequence.frames.len().saturating_sub(1);
+                sequence.selected
+            });
 
             self.queue_source(SourceRequest::CaptureUrl(url));
             self.pending_capture = Some(PendingCapture {
@@ -896,7 +1294,12 @@ impl GreenViewerApp {
                 processing_job_id: None,
                 file_name,
                 captured_at,
+                sequence_frame_index,
             });
+            if !self.source_loading {
+                self.remove_pending_capture_sequence_frame();
+                self.pending_capture = None;
+            }
             self.next_capture_due = Some(
                 now + Duration::from_secs_f32(
                     self.capture_interval_secs.max(MIN_CAPTURE_INTERVAL_SECONDS),
@@ -909,6 +1312,19 @@ impl GreenViewerApp {
             _ => Duration::from_millis(100),
         };
         ctx.request_repaint_after(delay.min(Duration::from_secs(1)));
+    }
+
+    fn remove_pending_capture_sequence_frame(&mut self) {
+        let Some(frame_index) = self.pending_capture.as_ref().and_then(|pending| pending.sequence_frame_index) else {
+            return;
+        };
+        let Some(sequence) = self.active_sequence.as_mut() else {
+            return;
+        };
+        if frame_index < sequence.frames.len() {
+            sequence.frames.remove(frame_index);
+            sequence.selected = sequence.selected.min(sequence.frames.len().saturating_sub(1));
+        }
     }
 
     fn save_pending_capture_original(&mut self) {
@@ -1114,6 +1530,9 @@ impl GreenViewerApp {
                             .and_then(|pending| pending.processing_job_id)
                             .is_some_and(|job_id| job_id == id)
                         {
+                            if !self.capture_save_original {
+                                self.remove_pending_capture_sequence_frame();
+                            }
                             self.pending_capture = None;
                         }
                         self.error = Some(error);
@@ -1186,6 +1605,9 @@ impl GreenViewerApp {
                         .and_then(|pending| pending.processing_job_id)
                         .is_some_and(|job_id| job_id == id)
                     {
+                        if !self.capture_save_original {
+                            self.remove_pending_capture_sequence_frame();
+                        }
                         self.pending_capture = None;
                     }
                     self.error = Some(error);
@@ -1193,6 +1615,12 @@ impl GreenViewerApp {
                 _ => {}
             }
         }
+    }
+
+    fn temporal_support_radius(&self) -> usize {
+        (self.temporal_lookahead_frames.max(4) / 2)
+            .saturating_sub(1)
+            .max(1)
     }
 
     fn temporal_support_masks_for_active_frame(&self) -> Vec<Arc<Vec<bool>>> {
@@ -1207,17 +1635,22 @@ impl GreenViewerApp {
             .original_rgba
             .as_ref()
             .map(|image| (image.width() as usize, image.height() as usize));
-        let mut support = Vec::new();
-        for offset in 1..=self.temporal_lookahead_frames.max(1) {
-            let Some(index) = current.checked_add(offset) else {
-                break;
-            };
-            if index >= sequence.frames.len() {
-                break;
+        let radius = self.temporal_support_radius();
+        let mut support = Vec::with_capacity(radius * 2);
+
+        for offset in 1..=radius {
+            if let Some(index) = current.checked_sub(offset) {
+                if let Some(cached) = self.sequence_mask_cache.get(&index) {
+                    if expected_dims.is_none_or(|dims| dims == (cached.width, cached.height)) {
+                        support.push(Arc::clone(&cached.mask));
+                    }
+                }
             }
-            if let Some(cached) = self.sequence_mask_cache.get(&index) {
-                if expected_dims.is_none_or(|dims| dims == (cached.width, cached.height)) {
-                    support.push(Arc::clone(&cached.mask));
+            if let Some(index) = current.checked_add(offset).filter(|index| *index < sequence.frames.len()) {
+                if let Some(cached) = self.sequence_mask_cache.get(&index) {
+                    if expected_dims.is_none_or(|dims| dims == (cached.width, cached.height)) {
+                        support.push(Arc::clone(&cached.mask));
+                    }
                 }
             }
         }
@@ -1584,6 +2017,57 @@ impl GreenViewerApp {
                 }
             });
         }
+
+        ui.collapsing("Glue sequences", |ui| {
+            ui.small("Sequences are concatenated in the order shown. Frames are copied into a new sequence and original timestamps are preserved in sequence.json.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Add active").clicked() {
+                    if let Some(root) = self.active_sequence.as_ref().map(|sequence| sequence.root.clone()) {
+                        self.add_sequence_glue_input(root);
+                    }
+                }
+                if ui.button("Add folder…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().set_title("Add sequence to glue list").pick_folder() {
+                        self.add_sequence_glue_input(path);
+                    }
+                }
+                if ui.button("Clear list").clicked() {
+                    self.sequence_glue_inputs.clear();
+                    self.save_preferences();
+                }
+            });
+            let mut remove = None;
+            let mut move_item: Option<(usize, isize)> = None;
+            for (index, entry) in self.sequence_glue_inputs.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                        move_item = Some((index, -1));
+                    }
+                    if ui.add_enabled(index + 1 < self.sequence_glue_inputs.len(), egui::Button::new("↓")).clicked() {
+                        move_item = Some((index, 1));
+                    }
+                    ui.monospace(format!("{:>2}. {}", index + 1, entry));
+                    if ui.small_button("×").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            }
+            if let Some((index, delta)) = move_item {
+                let other = (index as isize + delta) as usize;
+                self.sequence_glue_inputs.swap(index, other);
+                self.save_preferences();
+            }
+            if let Some(index) = remove {
+                self.sequence_glue_inputs.remove(index);
+                self.save_preferences();
+            }
+            if ui
+                .add_enabled(self.sequence_glue_inputs.len() >= 2, egui::Button::new("Glue into new sequence…"))
+                .clicked()
+            {
+                self.glue_sequences();
+            }
+        });
 
         ui.separator();
         ui.heading("Continuous capture");
@@ -2082,23 +2566,25 @@ impl GreenViewerApp {
             temporal_changed |= ui
                 .checkbox(
                     &mut self.temporal_filter_enabled,
-                    "Filter transient components using subsequent frames",
+                    "Filter transient components using surrounding frames",
                 )
                 .changed();
             temporal_changed |= ui
                 .add(
-                    egui::Slider::new(&mut self.temporal_lookahead_frames, 1..=12)
-                        .text("Look-ahead frames"),
+                    egui::Slider::new(&mut self.temporal_lookahead_frames, 4..=26)
+                        .text("Temporal window n"),
                 )
                 .changed();
-            if self.temporal_required_frames > self.temporal_lookahead_frames {
-                self.temporal_required_frames = self.temporal_lookahead_frames;
+            let support_radius = self.temporal_support_radius();
+            let max_confirmations = support_radius * 2;
+            if self.temporal_required_frames > max_confirmations {
+                self.temporal_required_frames = max_confirmations;
             }
             temporal_changed |= ui
                 .add(
                     egui::Slider::new(
                         &mut self.temporal_required_frames,
-                        1..=self.temporal_lookahead_frames.max(1),
+                        1..=max_confirmations.max(1),
                     )
                     .text("Required confirmations"),
                 )
@@ -2112,26 +2598,33 @@ impl GreenViewerApp {
                 .changed();
             if temporal_changed {
                 self.dirty = true;
+                self.save_preferences();
                 self.schedule_processing();
             }
 
-            let future_cached = self
+            let radius = self.temporal_support_radius();
+            ui.small(format!("Support radius = floor(n / 2) - 1 = {radius} frame(s) in each direction."));
+            let (back_cached, forward_cached) = self
                 .active_sequence
                 .as_ref()
                 .map(|sequence| {
-                    (1..=self.temporal_lookahead_frames)
-                        .filter_map(|offset| sequence.selected.checked_add(offset))
+                    let back = (1..=radius)
+                        .filter_map(|offset| sequence.selected.checked_sub(offset))
                         .filter(|index| self.sequence_mask_cache.contains_key(index))
-                        .count()
+                        .count();
+                    let forward = (1..=radius)
+                        .filter_map(|offset| sequence.selected.checked_add(offset))
+                        .filter(|index| *index < sequence.frames.len())
+                        .filter(|index| self.sequence_mask_cache.contains_key(index))
+                        .count();
+                    (back, forward)
                 })
-                .unwrap_or(0);
+                .unwrap_or((0, 0));
             ui.small(format!(
-                "Mask cache: {} frame(s); future support available for current frame: {}/{}.",
-                self.sequence_mask_cache.len(),
-                future_cached,
-                self.temporal_required_frames
+                "Window n={} → {} backward + {} forward; cached support {}/{} + {}/{}; required {}.",
+                self.temporal_lookahead_frames, radius, radius, back_cached, radius, forward_cached, radius, self.temporal_required_frames
             ));
-            ui.small("The look-ahead filter is applied when enough subsequent frame masks are already cached. Play/analyze the sequence once, then scrub back for temporally filtered review.");
+            ui.small("Temporal filtering uses cached masks on both sides of the current frame. Playing/analyzing the sequence populates the cache; edge frames naturally have fewer neighbours.");
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -2214,10 +2707,11 @@ impl GreenViewerApp {
             return;
         }
         let mut open = self.shape_plot_open;
-        egui::Window::new("Tracked mask size")
+        let response = egui::Window::new("Tracked mask size")
             .open(&mut open)
-            .default_pos(egui::pos2(720.0, 80.0))
-            .default_size(egui::vec2(680.0, 360.0))
+            .default_pos(self.shape_plot_window_pos)
+            .default_size(self.shape_plot_window_size)
+            .current_pos(self.shape_plot_window_pos)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.small("X = sequence frame · Y = mask area in pixels. Tracks update as frames are processed.");
@@ -2302,6 +2796,10 @@ impl GreenViewerApp {
                     }
                 });
             });
+        if let Some(response) = response {
+            self.shape_plot_window_pos = response.response.rect.min;
+            self.shape_plot_window_size = response.response.rect.size();
+        }
         self.shape_plot_open = open;
     }
 
@@ -2391,6 +2889,10 @@ impl GreenViewerApp {
 }
 
 impl eframe::App for GreenViewerApp {
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.save_preferences();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_dropped_files(&ctx);
@@ -2402,15 +2904,21 @@ impl eframe::App for GreenViewerApp {
 
         egui::CentralPanel::default().show(ui, |ui| self.previews(ui));
 
-        egui::Window::new("Controls / sequence")
-            .default_pos(egui::pos2(12.0, 24.0))
-            .default_size(egui::vec2(430.0, 850.0))
+        if let Some(response) = egui::Window::new("Controls / sequence")
+            .default_pos(self.controls_window_pos)
+            .default_size(self.controls_window_size)
+            .current_pos(self.controls_window_pos)
             .min_size(egui::vec2(330.0, 320.0))
             .resizable(true)
             .vscroll(true)
-            .show(&ctx, |ui| self.controls(ui));
+            .show(&ctx, |ui| self.controls(ui))
+        {
+            self.controls_window_pos = response.response.rect.min;
+            self.controls_window_size = response.response.rect.size();
+        }
 
         self.shape_size_plot_window(&ctx);
+        self.tick_preference_persistence(&ctx);
     }
 }
 
@@ -2423,7 +2931,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.7")
+        .user_agent("rust-edge-gui/0.7.1")
         .build()
         .expect("failed to build HTTP client");
 
@@ -3258,6 +3766,31 @@ fn load_image_sequence(root: &Path) -> Result<ImageSequence> {
     }
     if !root.is_dir() {
         return Err(anyhow!("{} is not a directory", root.display()));
+    }
+
+    let manifest_path = root.join("sequence.json");
+    if manifest_path.is_file() {
+        let bytes = std::fs::read(&manifest_path)
+            .with_context(|| format!("cannot read {}", manifest_path.display()))?;
+        let manifest: SequenceManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("cannot parse {}", manifest_path.display()))?;
+        if manifest.version != 1 {
+            return Err(anyhow!("unsupported sequence manifest version {} in {}", manifest.version, manifest_path.display()));
+        }
+        let mut frames = Vec::with_capacity(manifest.frames.len());
+        for frame in manifest.frames {
+            let path = PathBuf::from(&frame.path);
+            let path = if path.is_absolute() { path } else { root.join(path) };
+            if path.is_file() && is_supported_image_path(&path) {
+                frames.push(SequenceFrame {
+                    path,
+                    timestamp: UNIX_EPOCH + Duration::from_millis(frame.timestamp_ms),
+                });
+            }
+        }
+        if !frames.is_empty() {
+            return Ok(ImageSequence { root: root.to_path_buf(), frames, selected: 0 });
+        }
     }
 
     let candidate_dirs = [root.join("original"), root.join("processed"), root.to_path_buf()];

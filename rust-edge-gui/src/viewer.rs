@@ -11,6 +11,8 @@ pub struct ImageViewState {
     pub zoom: f32,
     pub pan: egui::Vec2,
     pub fit_to_window: bool,
+    pub window_pos: Option<egui::Pos2>,
+    pub window_size: Option<egui::Vec2>,
 }
 
 impl Default for ImageViewState {
@@ -20,6 +22,8 @@ impl Default for ImageViewState {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             fit_to_window: true,
+            window_pos: None,
+            window_size: None,
         }
     }
 }
@@ -71,22 +75,28 @@ pub fn show_floating_image_window(
     let mut open = state.open;
     let mut interaction = ViewInteraction::default();
 
-    egui::Window::new(title)
+    let mut window = egui::Window::new(title)
         .open(&mut open)
-        .default_pos(default_pos)
-        .default_size(egui::vec2(620.0, 620.0))
+        .default_pos(state.window_pos.unwrap_or(default_pos))
+        .default_size(state.window_size.unwrap_or_else(|| egui::vec2(620.0, 620.0)))
         .min_size(egui::vec2(300.0, 240.0))
-        .resizable(true)
-        .show(ctx, |ui| {
-            interaction = show_image_window_contents(
-                ui,
-                texture,
-                pixel_source,
-                overlays,
-                allow_pivot_hotkey,
-                state,
-            );
-        });
+        .resizable(true);
+    if let Some(pos) = state.window_pos {
+        window = window.current_pos(pos);
+    }
+    if let Some(response) = window.show(ctx, |ui| {
+        interaction = show_image_window_contents(
+            ui,
+            texture,
+            pixel_source,
+            overlays,
+            allow_pivot_hotkey,
+            state,
+        );
+    }) {
+        state.window_pos = Some(response.response.rect.min);
+        state.window_size = Some(response.response.rect.size());
+    }
 
     state.open = open;
     interaction

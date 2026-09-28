@@ -1,6 +1,15 @@
-# rust-edge-gui 0.7.0
+# rust-edge-gui 0.7.1
 
 Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, native offline YOLO segmentation, per-window navigation, sequence playback, temporal false-positive filtering, and tracked mask-area plots.
+
+
+## What changed in 0.7.1
+
+- **Live recording stays a sequence** — continuous capture no longer clears `active_sequence`. The sequence/timeline and temporal controls remain visible while frames arrive, and the live timeline grows frame-by-frame.
+- **Sequence glue UI** — add multiple sequence folders, reorder them with ↑/↓, and glue them into a new sequence. Frames are copied into `original/`; `sequence.json` preserves the original timestamps.
+- **Symmetric temporal filter** — temporal persistence now uses both previous and future cached masks. For a configured window `n`, support radius is `floor(n/2) - 1` frames backward and the same number forward.
+- **Persistent GUI state** — detector parameters, colors, YOLO controls, temporal/tracking/playback controls, capture options, histories, glue list, image-window pan/zoom/open state, floating-window positions/sizes, and egui scroll/collapse state are restored after relaunch.
+- **Native window persistence** — eframe persistence is enabled with a stable `rust-edge-gui` app ID, so the main OS window position/size is restored too.
 
 
 ## What changed in 0.7
@@ -12,7 +21,7 @@ Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP 
 - **Tracked mask pivots** — while a sequence is open, hover a closed component in the Processed window and press `P`. The component becomes a tracked shape; its marker follows the matched component centroid on subsequent processed frames.
 - **Cross-frame shape matching** — tracked components are associated frame-to-frame by configurable mask IoU.
 - **Floating size plot** — tracked component area (pixels) is plotted against sequence frame as masks are processed.
-- **Temporal false-positive filter** — optionally require a component to overlap masks in subsequent cached frames before it is rendered in the final processed image. Configure look-ahead length, required confirmations and overlap threshold.
+- **Temporal false-positive filter** — optionally require a component to overlap masks in surrounding cached frames before it is rendered in the final processed image. Configure temporal window `n`, required confirmations and overlap threshold.
 
 ### Sequence tracking workflow
 
@@ -21,7 +30,7 @@ Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP 
 3. In the **Processed** window, hover the plant/leaf component and press `P`.
 4. Adjust **Same-shape IoU** if the shape grows or moves enough to break matching.
 5. Open **Tracked mask size** to see the area curve.
-6. For temporal cleanup, enable **Filter transient components using subsequent frames**. The filter uses already-cached future masks, so for a full look-ahead pass play/analyze the sequence first and then scrub back.
+6. For temporal cleanup, enable **Filter transient components using surrounding frames**. For temporal window `n`, the app uses `floor(n/2)-1` cached frames before and after the current frame. Play/analyze the sequence to populate the cache, then scrub/replay for the full symmetric filter.
 
 ## What changed in 0.6
 
@@ -169,7 +178,7 @@ Every loaded frame is automatically processed with the currently selected detect
 
 ## Image sequences and history
 
-The GUI persists recent single-image/URL sources and recent image-sequence folders.
+The GUI persists recent single-image/URL sources and recent image-sequence folders. It also persists detector/UI settings and floating-window geometry. Continuous recording is intentionally **not** auto-resumed after relaunch.
 
 Opening a sequence adds an editor-style timeline/transport with:
 
@@ -181,7 +190,9 @@ Opening a sequence adds an editor-style timeline/transport with:
 - optional loop and wait-for-processing playback;
 - `P` hotkey tracking for a closed processed-mask component;
 - cross-frame IoU matching and a floating mask-area plot;
-- optional subsequent-frame persistence filtering for transient false positives.
+- optional symmetric previous/next-frame persistence filtering for transient false positives;
+- live-growing timelines during continuous capture;
+- sequence glue/concatenation with timestamp-preserving `sequence.json`.
 
 A capture-session root can be opened directly. The sequence loader prefers `original/`, then `processed/`, then images in the selected folder.
 

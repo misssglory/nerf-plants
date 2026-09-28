@@ -1,5 +1,16 @@
 # Changes
 
+## 0.7.1
+
+- Fixed continuous capture clearing `active_sequence`; sequence/timeline and temporal controls now stay visible while recording.
+- Continuous capture now appends each incoming frame to the active live sequence so the timeline grows during recording.
+- Added sequence glue UI with ordered inputs, ↑/↓ reordering, frame copying, and timestamp-preserving `sequence.json` manifests.
+- Sequence loader now understands `sequence.json` manifests before falling back to `original/`, `processed/`, or root-folder scans.
+- Temporal filtering is now symmetric: support radius is `floor(n/2)-1` frames backward and forward instead of future-only look-ahead.
+- Persisted mask/color settings, YOLO settings, temporal/tracking/playback settings, capture options, history fields, glue list, independent image-view transforms, and floating-window geometry.
+- Enabled eframe persistence and stable app ID so the main native window plus egui memory (scroll/collapse state) survive relaunches.
+- Bumped package version to 0.7.1.
+
 ## 0.7.0
 
 - Removed linked image transforms; Original, Processed and YOLO windows now keep completely independent pan/zoom state.
