@@ -1,5 +1,19 @@
 # Changes
 
+## 0.7.0
+
+- Removed linked image transforms; Original, Processed and YOLO windows now keep completely independent pan/zoom state.
+- Trackpad gestures are applied only when the pointer is over the unobscured image viewport.
+- Switched all normal GUI text styles to monospace/constant-width fonts.
+- Moved controls, notifications/status and sequence transport into one floating vertically scrollable window.
+- Added sequence Play/Pause/Prev/Next transport, configurable FPS, loop mode and optional wait-for-processing playback.
+- Added `P` hotkey on the Processed sequence view to create a pivot on the closed mask component under the cursor.
+- Added tracked-shape association between frames using configurable component IoU; the visible pivot marker follows the matched component centroid.
+- Added floating tracked-mask-area plot with one curve per pivot/shape.
+- Added per-sequence mask cache used for tracking and temporal filtering.
+- Added temporal false-positive filter using configurable future-frame look-ahead, confirmation count and overlap threshold.
+- Bumped package version to 0.7.0.
+
 ## 0.6.1
 
 - Fixed compile error caused by stale `yolo_last_mask_pixels` and `yolo_last_instances` field names.

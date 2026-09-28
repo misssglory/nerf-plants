@@ -1,6 +1,27 @@
-# rust-edge-gui 0.6.1
+# rust-edge-gui 0.7.0
 
-Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, and native offline YOLO segmentation through ONNX Runtime.
+Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, native offline YOLO segmentation, per-window navigation, sequence playback, temporal false-positive filtering, and tracked mask-area plots.
+
+
+## What changed in 0.7
+
+- **Independent image navigation** — Original, Processed and YOLO windows no longer share pan/zoom state. Trackpad pan/zoom is accepted only by the visible image viewport under the pointer.
+- **Monospace UI** — all normal GUI text styles use a constant-width font.
+- **Floating scrollable controls** — controls, status and sequence transport live in one floating window instead of competing bottom/side panels.
+- **Sequence playback** — Play/Pause/Prev/Next, configurable playback FPS, loop mode and optional wait-for-processing mode.
+- **Tracked mask pivots** — while a sequence is open, hover a closed component in the Processed window and press `P`. The component becomes a tracked shape; its marker follows the matched component centroid on subsequent processed frames.
+- **Cross-frame shape matching** — tracked components are associated frame-to-frame by configurable mask IoU.
+- **Floating size plot** — tracked component area (pixels) is plotted against sequence frame as masks are processed.
+- **Temporal false-positive filter** — optionally require a component to overlap masks in subsequent cached frames before it is rendered in the final processed image. Configure look-ahead length, required confirmations and overlap threshold.
+
+### Sequence tracking workflow
+
+1. Open an image sequence.
+2. Leave **Wait for processing** enabled and press **Play** to process frames sequentially.
+3. In the **Processed** window, hover the plant/leaf component and press `P`.
+4. Adjust **Same-shape IoU** if the shape grows or moves enough to break matching.
+5. Open **Tracked mask size** to see the area curve.
+6. For temporal cleanup, enable **Filter transient components using subsequent frames**. The filter uses already-cached future masks, so for a full look-ahead pass play/analyze the sequence first and then scrub back.
 
 ## What changed in 0.6
 
@@ -116,7 +137,7 @@ There are three floating views:
 - **Processed — final plant mask**;
 - **YOLO raw plant mask** — available after a YOLO/Hybrid inference.
 
-Pan/zoom can be linked across all three.
+Each image window owns its own pan/zoom state; trackpad gestures affect only the image viewport under the pointer.
 
 ## Camera loading
 
@@ -150,12 +171,17 @@ Every loaded frame is automatically processed with the currently selected detect
 
 The GUI persists recent single-image/URL sources and recent image-sequence folders.
 
-Opening a sequence adds an editor-style timeline with:
+Opening a sequence adds an editor-style timeline/transport with:
 
 - frame number;
 - **ABS** wall-clock/file timestamp;
 - **VIDEO** time relative to the first frame;
-- a scrub slider that loads and reprocesses the selected frame.
+- a scrub slider that loads and reprocesses the selected frame;
+- Play/Pause/Prev/Next and configurable playback FPS;
+- optional loop and wait-for-processing playback;
+- `P` hotkey tracking for a closed processed-mask component;
+- cross-frame IoU matching and a floating mask-area plot;
+- optional subsequent-frame persistence filtering for transient false positives.
 
 A capture-session root can be opened directly. The sequence loader prefers `original/`, then `processed/`, then images in the selected folder.
 

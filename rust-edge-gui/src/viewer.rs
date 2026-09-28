@@ -40,17 +40,18 @@ impl ImageViewState {
         self.zoom = 1.0;
         self.pan = egui::Vec2::ZERO;
     }
+}
 
-    pub fn copy_transform_from(&mut self, other: &Self) {
-        self.zoom = other.zoom;
-        self.pan = other.pan;
-        self.fit_to_window = other.fit_to_window;
-    }
+#[derive(Clone, Debug)]
+pub struct OverlayPoint {
+    pub pixel: (u32, u32),
+    pub color: egui::Color32,
+    pub label: String,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ViewInteraction {
-    pub transform_changed: bool,
+    pub pivot_pixel: Option<(u32, u32)>,
 }
 
 pub fn show_floating_image_window(
@@ -58,6 +59,8 @@ pub fn show_floating_image_window(
     title: &str,
     texture: Option<&egui::TextureHandle>,
     pixel_source: Option<&RgbaImage>,
+    overlays: &[OverlayPoint],
+    allow_pivot_hotkey: bool,
     state: &mut ImageViewState,
     default_pos: egui::Pos2,
 ) -> ViewInteraction {
@@ -75,7 +78,14 @@ pub fn show_floating_image_window(
         .min_size(egui::vec2(300.0, 240.0))
         .resizable(true)
         .show(ctx, |ui| {
-            interaction = show_image_window_contents(ui, texture, pixel_source, state);
+            interaction = show_image_window_contents(
+                ui,
+                texture,
+                pixel_source,
+                overlays,
+                allow_pivot_hotkey,
+                state,
+            );
         });
 
     state.open = open;
@@ -86,6 +96,8 @@ fn show_image_window_contents(
     ui: &mut egui::Ui,
     texture: Option<&egui::TextureHandle>,
     pixel_source: Option<&RgbaImage>,
+    overlays: &[OverlayPoint],
+    allow_pivot_hotkey: bool,
     state: &mut ImageViewState,
 ) -> ViewInteraction {
     let mut interaction = ViewInteraction::default();
@@ -93,23 +105,18 @@ fn show_image_window_contents(
     ui.horizontal_wrapped(|ui| {
         if ui.selectable_label(state.fit_to_window, "Fit").clicked() {
             state.reset_fit();
-            interaction.transform_changed = true;
         }
         if ui.button("1:1").clicked() {
             state.one_to_one();
-            interaction.transform_changed = true;
         }
         if ui.button("Center").clicked() {
             state.center();
-            interaction.transform_changed = true;
         }
         if ui.small_button("−").clicked() {
             state.fit_to_window = false;
             state.zoom = (state.zoom / 1.25).clamp(MIN_ZOOM, MAX_ZOOM);
-            interaction.transform_changed = true;
         }
 
-        let before = state.zoom;
         if ui
             .add(
                 egui::Slider::new(&mut state.zoom, MIN_ZOOM..=MAX_ZOOM)
@@ -120,22 +127,21 @@ fn show_image_window_contents(
             .changed()
         {
             state.fit_to_window = false;
-            interaction.transform_changed = true;
         }
 
         if ui.small_button("+").clicked() {
             state.fit_to_window = false;
             state.zoom = (state.zoom * 1.25).clamp(MIN_ZOOM, MAX_ZOOM);
-            interaction.transform_changed = true;
         }
 
-        if (state.zoom - before).abs() > f32::EPSILON {
-            interaction.transform_changed = true;
-        }
         ui.monospace(format!("{:>5.0}%", state.zoom * 100.0));
     });
 
-    ui.small("Drag = move · two-finger scroll = pan · pinch / Ctrl+wheel = zoom");
+    if allow_pivot_hotkey {
+        ui.small("Drag = move · two-finger scroll = pan · pinch/Ctrl+wheel = zoom · P = track mask shape under cursor");
+    } else {
+        ui.small("Drag = move · two-finger scroll = pan · pinch/Ctrl+wheel = zoom");
+    }
     ui.separator();
 
     let viewport_size = finite_available_size(ui, egui::vec2(420.0, 320.0));
@@ -149,7 +155,7 @@ fn show_image_window_contents(
             viewport.center(),
             egui::Align2::CENTER_CENTER,
             "No image loaded",
-            egui::FontId::proportional(15.0),
+            egui::FontId::monospace(15.0),
             egui::Color32::GRAY,
         );
         return interaction;
@@ -167,16 +173,17 @@ fn show_image_window_contents(
         state.pan = egui::Vec2::ZERO;
     }
 
+    // Every window owns its own ImageViewState. Gestures are applied only to the
+    // image viewport currently under the pointer; no transforms are mirrored.
     if response.dragged() {
         let delta = ui.input(|input| input.pointer.delta());
         if delta != egui::Vec2::ZERO {
             state.fit_to_window = false;
             state.pan += delta;
-            interaction.transform_changed = true;
         }
     }
 
-    if response.hovered() {
+    if response.contains_pointer() {
         let (zoom_delta, translation_delta, hover_pos) = ui.input(|input| {
             (
                 input.zoom_delta(),
@@ -190,11 +197,9 @@ fn show_image_window_contents(
                 .filter(|pos| viewport.contains(*pos))
                 .unwrap_or_else(|| viewport.center());
             zoom_about_point(state, image_size, viewport, anchor, zoom_delta);
-            interaction.transform_changed = true;
         } else if translation_delta.length_sq() > 0.01 && !response.dragged() {
             state.fit_to_window = false;
             state.pan += translation_delta;
-            interaction.transform_changed = true;
         }
     }
 
@@ -211,39 +216,69 @@ fn show_image_window_contents(
         egui::Color32::WHITE,
     );
 
-    if let (Some(source), Some(pointer)) = (pixel_source, response.hover_pos()) {
-        if image_rect.contains(pointer) && source.width() > 0 && source.height() > 0 {
+    for point in overlays {
+        let px = point.pixel.0 as f32 + 0.5;
+        let py = point.pixel.1 as f32 + 0.5;
+        if px >= 0.0 && py >= 0.0 && px < image_size.x && py < image_size.y {
+            let screen = egui::pos2(
+                image_rect.min.x + px / image_size.x * image_rect.width(),
+                image_rect.min.y + py / image_size.y * image_rect.height(),
+            );
+            painter.circle_filled(screen, 5.0, point.color);
+            painter.circle_stroke(screen, 8.0, egui::Stroke::new(1.5, point.color));
+            painter.text(
+                screen + egui::vec2(10.0, -10.0),
+                egui::Align2::LEFT_BOTTOM,
+                &point.label,
+                egui::FontId::monospace(11.0),
+                point.color,
+            );
+        }
+    }
+
+    if response.contains_pointer() {
+        if let Some(pointer) = response.hover_pos() {
+            if image_rect.contains(pointer) {
             let u = ((pointer.x - image_rect.min.x) / image_rect.width()).clamp(0.0, 0.999_999);
             let v = ((pointer.y - image_rect.min.y) / image_rect.height()).clamp(0.0, 0.999_999);
-            let x = (u * source.width() as f32).floor() as u32;
-            let y = (v * source.height() as f32).floor() as u32;
-            let pixel = source.get_pixel(x, y).0;
-            let text = format!(
-                "x:{x} y:{y}  RGBA {}, {}, {}, {}  #{:02X}{:02X}{:02X}{:02X}",
-                pixel[0], pixel[1], pixel[2], pixel[3], pixel[0], pixel[1], pixel[2], pixel[3]
-            );
+            let x = (u * image_size.x).floor() as u32;
+            let y = (v * image_size.y).floor() as u32;
+            if allow_pivot_hotkey && ui.input(|input| input.key_pressed(egui::Key::P)) {
+                interaction.pivot_pixel = Some((x, y));
+            }
 
-            let mut label_pos = pointer + egui::vec2(12.0, 12.0);
-            let label_size = egui::vec2(330.0, 24.0);
-            if label_pos.x + label_size.x > viewport.right() {
-                label_pos.x = pointer.x - label_size.x - 12.0;
+            if let Some(source) = pixel_source {
+                if x < source.width() && y < source.height() {
+                    let pixel = source.get_pixel(x, y).0;
+                    let text = format!(
+                        "x:{x} y:{y}  RGBA {}, {}, {}, {}  #{:02X}{:02X}{:02X}{:02X}",
+                        pixel[0], pixel[1], pixel[2], pixel[3], pixel[0], pixel[1], pixel[2], pixel[3]
+                    );
+
+                    let mut label_pos = pointer + egui::vec2(12.0, 12.0);
+                    let label_size = egui::vec2(350.0, 24.0);
+                    if label_pos.x + label_size.x > viewport.right() {
+                        label_pos.x = pointer.x - label_size.x - 12.0;
+                    }
+                    if label_pos.y + label_size.y > viewport.bottom() {
+                        label_pos.y = pointer.y - label_size.y - 12.0;
+                    }
+                    let label_rect = egui::Rect::from_min_size(label_pos, label_size);
+                    painter.rect_filled(
+                        label_rect,
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                    );
+                    painter.text(
+                        label_rect.min + egui::vec2(6.0, 5.0),
+                        egui::Align2::LEFT_TOP,
+                        text,
+                        egui::FontId::monospace(12.0),
+                        egui::Color32::WHITE,
+                    );
+                }
             }
-            if label_pos.y + label_size.y > viewport.bottom() {
-                label_pos.y = pointer.y - label_size.y - 12.0;
             }
-            let label_rect = egui::Rect::from_min_size(label_pos, label_size);
-            painter.rect_filled(
-                label_rect,
-                3.0,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
-            );
-            painter.text(
-                label_rect.min + egui::vec2(6.0, 5.0),
-                egui::Align2::LEFT_TOP,
-                text,
-                egui::FontId::monospace(12.0),
-                egui::Color32::WHITE,
-            );
         }
     }
 
