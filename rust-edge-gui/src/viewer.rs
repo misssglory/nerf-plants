@@ -76,10 +76,15 @@ pub fn show_floating_image_window(
     let mut interaction = ViewInteraction::default();
 
     let mut window = egui::Window::new(title)
+        .id(egui::Id::new(("image-window", title)))
         .open(&mut open)
         .default_pos(state.window_pos.unwrap_or(default_pos))
         .default_size(state.window_size.unwrap_or_else(|| egui::vec2(620.0, 620.0)))
         .min_size(egui::vec2(300.0, 240.0))
+        // Preserve exact persisted floating-window coordinates. Egui's default
+        // screen constraint may otherwise clamp restored positions during the
+        // first frame while image contents are still changing size.
+        .constrain(false)
         .resizable(true);
     if let Some(pos) = state.window_pos {
         window = window.current_pos(pos);

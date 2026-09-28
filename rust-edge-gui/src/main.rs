@@ -20,7 +20,7 @@ use yolo::{
     YoloRuntimeSettings, YoloWorker,
 };
 
-const APP_TITLE: &str = "Rust Edge GUI v0.7.2 — Robust Live Sequences";
+const APP_TITLE: &str = "Rust Edge GUI v0.7.3 — Anchored Shape Tracking";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -500,9 +500,17 @@ struct ShapeObservation {
 struct ShapeTrack {
     id: u64,
     name: String,
-    pivot: (u32, u32),
-    reference_frame: usize,
-    reference_pixels: Vec<u32>,
+    /// Immutable identity anchor: the exact user-picked pixel and frame.
+    /// Tracking may adapt to mask growth/shrink, but never rewrites this origin.
+    anchor_pivot: (u32, u32),
+    anchor_frame: usize,
+    anchor_width: usize,
+    anchor_height: usize,
+    anchor_pixels: Vec<u32>,
+    /// Per-frame matched component geometry. Keeping this history lets us match
+    /// outward from the anchor in either time direction without reference drift.
+    matched_pixels: BTreeMap<usize, Vec<u32>>,
+    matched_centroids: BTreeMap<usize, (u32, u32)>,
     observations: BTreeMap<usize, ShapeObservation>,
     enabled: bool,
 }
@@ -1870,32 +1878,71 @@ impl GreenViewerApp {
         }
         let threshold = self.track_overlap_threshold.clamp(0.0, 1.0);
         for track in &mut self.shape_tracks {
-            if !track.enabled {
+            if !track.enabled || track.anchor_width != width || track.anchor_height != height {
                 continue;
             }
-            let mut best: Option<(&MaskComponent, f32)> = None;
-            for component in &components {
-                let overlap = component_iou(&track.reference_pixels, &component.pixels);
-                if best.is_none_or(|(_, score)| overlap > score) {
-                    best = Some((component, overlap));
+            update_one_shape_track(track, frame_index, width, &components, threshold);
+        }
+    }
+
+    fn rebuild_shape_track_from_cached_masks(&mut self, track_id: u64) {
+        let Some(track_index) = self.shape_tracks.iter().position(|track| track.id == track_id) else {
+            return;
+        };
+        let anchor_frame = self.shape_tracks[track_index].anchor_frame;
+        let anchor_width = self.shape_tracks[track_index].anchor_width;
+        let anchor_height = self.shape_tracks[track_index].anchor_height;
+        let anchor_pixels = self.shape_tracks[track_index].anchor_pixels.clone();
+        let anchor_pivot = self.shape_tracks[track_index].anchor_pivot;
+        let anchor_area = anchor_pixels.len();
+        let threshold = self.track_overlap_threshold.clamp(0.0, 1.0);
+
+        // Snapshot the cache before mutably borrowing the track. Recording already
+        // populated many of these masks, so pivoting can immediately backfill the
+        // historical plot without requiring playback.
+        let cached = self
+            .sequence_mask_cache
+            .iter()
+            .filter(|(_, cached)| cached.width == anchor_width && cached.height == anchor_height)
+            .map(|(&index, cached)| (index, Arc::clone(&cached.mask)))
+            .collect::<BTreeMap<_, _>>();
+
+        let track = &mut self.shape_tracks[track_index];
+        track.observations.clear();
+        track.matched_pixels.clear();
+        track.matched_centroids.clear();
+        track.observations.insert(
+            anchor_frame,
+            ShapeObservation {
+                area: anchor_area,
+                overlap: 1.0,
+            },
+        );
+        track.matched_pixels.insert(anchor_frame, anchor_pixels);
+        track.matched_centroids.insert(anchor_frame, anchor_pivot);
+
+        let max_distance = cached
+            .keys()
+            .map(|index| index.abs_diff(anchor_frame))
+            .max()
+            .unwrap_or(0);
+        for distance in 1..=max_distance {
+            for index in [
+                anchor_frame.checked_sub(distance),
+                anchor_frame.checked_add(distance),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let Some(mask) = cached.get(&index) else {
+                    continue;
+                };
+                let components = extract_mask_components(mask.as_ref(), anchor_width, anchor_height);
+                if components.is_empty() {
+                    continue;
                 }
+                update_one_shape_track(track, index, anchor_width, &components, threshold);
             }
-            let Some((component, overlap)) = best else {
-                continue;
-            };
-            if overlap + f32::EPSILON < threshold {
-                continue;
-            }
-            track.observations.insert(
-                frame_index,
-                ShapeObservation {
-                    area: component.area,
-                    overlap,
-                },
-            );
-            track.reference_frame = frame_index;
-            track.pivot = component_centroid(component, width);
-            track.reference_pixels = component.pixels.clone();
         }
     }
 
@@ -1930,6 +1977,8 @@ impl GreenViewerApp {
         };
 
         self.next_track_id = self.next_track_id.wrapping_add(1).max(1);
+        let track_id = self.next_track_id;
+        let anchor_pixels = component.pixels;
         let mut observations = BTreeMap::new();
         observations.insert(
             frame_index,
@@ -1938,33 +1987,59 @@ impl GreenViewerApp {
                 overlap: 1.0,
             },
         );
+        let mut matched_pixels = BTreeMap::new();
+        matched_pixels.insert(frame_index, anchor_pixels.clone());
+        let mut matched_centroids = BTreeMap::new();
+        matched_centroids.insert(frame_index, pixel);
+
         self.shape_tracks.push(ShapeTrack {
-            id: self.next_track_id,
-            name: format!("shape-{}", self.next_track_id),
-            pivot: pixel,
-            reference_frame: frame_index,
-            reference_pixels: component.pixels,
+            id: track_id,
+            name: format!("shape-{track_id}"),
+            anchor_pivot: pixel,
+            anchor_frame: frame_index,
+            anchor_width: width,
+            anchor_height: height,
+            anchor_pixels,
+            matched_pixels,
+            matched_centroids,
             observations,
             enabled: true,
         });
+        self.rebuild_shape_track_from_cached_masks(track_id);
         self.shape_plot_open = true;
+        let samples = self
+            .shape_tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| track.observations.len())
+            .unwrap_or(1);
         self.status = format!(
-            "Tracking shape {} from frame {} at pivot ({}, {}).",
-            self.next_track_id,
+            "Tracking shape {track_id} anchored at frame {} / pivot ({}, {}); {} cached sample(s) matched.",
             frame_index.saturating_add(1),
             pixel.0,
-            pixel.1
+            pixel.1,
+            samples
         );
     }
 
     fn track_overlays(&self) -> Vec<viewer::OverlayPoint> {
+        let current_frame = self.active_sequence.as_ref().map(|sequence| sequence.selected);
         self.shape_tracks
             .iter()
             .filter(|track| track.enabled)
-            .map(|track| viewer::OverlayPoint {
-                pixel: track.pivot,
-                color: track_color(track.id),
-                label: format!("T{}", track.id),
+            .map(|track| {
+                let pixel = current_frame
+                    .and_then(|frame| track.matched_centroids.get(&frame).copied())
+                    .unwrap_or(track.anchor_pivot);
+                viewer::OverlayPoint {
+                    pixel,
+                    color: track_color(track.id),
+                    label: if current_frame == Some(track.anchor_frame) {
+                        format!("T{} anchor", track.id)
+                    } else {
+                        format!("T{}", track.id)
+                    },
+                }
             })
             .collect()
     }
@@ -2718,12 +2793,21 @@ impl GreenViewerApp {
         }
         ui.collapsing("Sequence mask tracking / temporal filter", |ui| {
             ui.label("Shape tracking");
-            ui.add(
-                egui::Slider::new(&mut self.track_overlap_threshold, 0.0..=1.0)
-                    .text("Same-shape IoU")
-                    .fixed_decimals(2),
-            );
-            ui.small("Hover a closed component in the Processed window and press P to add a pivot/track. The component is matched between frames by IoU.");
+            let overlap_changed = ui
+                .add(
+                    egui::Slider::new(&mut self.track_overlap_threshold, 0.0..=1.0)
+                        .text("Same-shape overlap")
+                        .fixed_decimals(2),
+                )
+                .changed();
+            if overlap_changed {
+                let track_ids = self.shape_tracks.iter().map(|track| track.id).collect::<Vec<_>>();
+                for track_id in track_ids {
+                    self.rebuild_shape_track_from_cached_masks(track_id);
+                }
+                self.save_preferences();
+            }
+            ui.small("Hover a closed component in Processed and press P. The clicked pixel + frame become an immutable identity anchor; matching then propagates outward through neighbouring cached masks.");
 
             ui.separator();
             let mut temporal_changed = false;
@@ -2811,7 +2895,13 @@ impl GreenViewerApp {
                     ui.checkbox(&mut track.enabled, "");
                     ui.colored_label(track_color(track.id), format!("T{}", track.id));
                     ui.text_edit_singleline(&mut track.name);
-                    ui.monospace(format!("{} samples · ref {}", track.observations.len(), track.reference_frame.saturating_add(1)));
+                    ui.monospace(format!(
+                        "{} samples · anchor f{} @ {},{}",
+                        track.observations.len(),
+                        track.anchor_frame.saturating_add(1),
+                        track.anchor_pivot.0,
+                        track.anchor_pivot.1
+                    ));
                     if ui.small_button("×").clicked() {
                         remove_track = Some(index);
                     }
@@ -2872,28 +2962,42 @@ impl GreenViewerApp {
         }
         let mut open = self.shape_plot_open;
         let response = egui::Window::new("Tracked mask size")
+            .id(egui::Id::new("tracked-mask-size-window"))
             .open(&mut open)
             .default_pos(self.shape_plot_window_pos)
             .default_size(self.shape_plot_window_size)
             .current_pos(self.shape_plot_window_pos)
-            .resizable(true)
+            .min_size(egui::vec2(420.0, 240.0))
+            .constrain(false)
+            .resizable([true, true])
             .show(ctx, |ui| {
-                ui.small("X = sequence frame · Y = mask area in pixels. Tracks update as frames are processed.");
-                let desired = egui::vec2(ui.available_width().max(300.0), ui.available_height().max(220.0));
-                let (response, painter) = ui.allocate_painter(desired, egui::Sense::hover());
-                let rect = response.rect.shrink2(egui::vec2(48.0, 28.0));
+                ui.small("X = absolute capture time · Y = mask area in pixels. Dashed vertical line = currently rendered frame.");
+
+                // Size the canvas from the actual persisted/user-picked outer window
+                // rectangle, not from the Resize max-rect. Using the max-rect here makes
+                // a canvas self-request the maximum height, which in turn prevents the
+                // user from shrinking the plot window. During a drag this trails the
+                // resize by at most one frame, then follows the new size exactly.
+                let desired_plot_width = (self.shape_plot_window_size.x - 28.0).max(360.0);
+                let desired_plot_height = (self.shape_plot_window_size.y - 104.0).max(130.0);
+                let available_width = ui.available_width();
+                let plot_width = if available_width.is_finite() {
+                    desired_plot_width.min(available_width.max(360.0))
+                } else {
+                    desired_plot_width
+                };
+                let plot_size = egui::vec2(plot_width, desired_plot_height);
+                let (response, painter) =
+                    ui.allocate_painter(plot_size, egui::Sense::hover());
+                let rect = response.rect.shrink2(egui::vec2(58.0, 32.0));
                 let border = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
                 painter.line_segment([rect.left_top(), rect.right_top()], border);
                 painter.line_segment([rect.right_top(), rect.right_bottom()], border);
                 painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
                 painter.line_segment([rect.left_bottom(), rect.left_top()], border);
 
-                let mut max_frame = 1usize;
                 let mut max_area = 1usize;
                 for track in self.shape_tracks.iter().filter(|track| track.enabled) {
-                    if let Some((&frame, _)) = track.observations.last_key_value() {
-                        max_frame = max_frame.max(frame);
-                    }
                     max_area = max_area.max(
                         track
                             .observations
@@ -2903,38 +3007,71 @@ impl GreenViewerApp {
                             .unwrap_or(1),
                     );
                 }
-                if let Some(sequence) = self.active_sequence.as_ref() {
-                    max_frame = max_frame.max(sequence.frames.len().saturating_sub(1));
+
+                let sequence = self.active_sequence.as_ref();
+                let (start_time, end_time) = sequence
+                    .and_then(|sequence| {
+                        Some((
+                            sequence.frames.first()?.timestamp,
+                            sequence.frames.last()?.timestamp,
+                        ))
+                    })
+                    .unwrap_or((UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(1)));
+                let span = end_time
+                    .duration_since(start_time)
+                    .unwrap_or(Duration::from_secs(1))
+                    .max(Duration::from_millis(1));
+
+                let x_for_frame = |frame: usize| -> Option<f32> {
+                    let sequence = sequence?;
+                    let timestamp = sequence.frames.get(frame)?.timestamp;
+                    let offset = timestamp.duration_since(start_time).ok()?;
+                    Some(
+                        rect.left()
+                            + (offset.as_secs_f64() / span.as_secs_f64()) as f32 * rect.width(),
+                    )
+                };
+
+                for step in 0..=4 {
+                    let t = step as f32 / 4.0;
+                    let y = egui::lerp(rect.bottom()..=rect.top(), t);
+                    painter.line_segment(
+                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        egui::Stroke::new(0.5, egui::Color32::from_gray(45)),
+                    );
+                    painter.text(
+                        egui::pos2(rect.left() - 7.0, y),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("{} px", (max_area as f32 * t).round() as usize),
+                        egui::FontId::monospace(10.0),
+                        egui::Color32::GRAY,
+                    );
                 }
 
-                painter.text(
-                    egui::pos2(rect.left(), rect.bottom() + 7.0),
-                    egui::Align2::LEFT_TOP,
-                    "0",
-                    egui::FontId::monospace(11.0),
-                    egui::Color32::GRAY,
-                );
-                painter.text(
-                    egui::pos2(rect.right(), rect.bottom() + 7.0),
-                    egui::Align2::RIGHT_TOP,
-                    format!("{}", max_frame.saturating_add(1)),
-                    egui::FontId::monospace(11.0),
-                    egui::Color32::GRAY,
-                );
-                painter.text(
-                    egui::pos2(rect.left() - 6.0, rect.top()),
-                    egui::Align2::RIGHT_TOP,
-                    format!("{} px", max_area),
-                    egui::FontId::monospace(11.0),
-                    egui::Color32::GRAY,
-                );
+                for step in 0..=4 {
+                    let t = step as f64 / 4.0;
+                    let tick_time = start_time + Duration::from_secs_f64(span.as_secs_f64() * t);
+                    let x = egui::lerp(rect.left()..=rect.right(), t as f32);
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(0.5, egui::Color32::from_gray(35)),
+                    );
+                    painter.text(
+                        egui::pos2(x, rect.bottom() + 8.0),
+                        egui::Align2::CENTER_TOP,
+                        format_plot_axis_time(tick_time, span),
+                        egui::FontId::monospace(10.0),
+                        egui::Color32::GRAY,
+                    );
+                }
 
                 for track in self.shape_tracks.iter().filter(|track| track.enabled) {
                     let color = track_color(track.id);
                     let mut points = Vec::new();
                     for (&frame, observation) in &track.observations {
-                        let x = rect.left()
-                            + frame as f32 / max_frame.max(1) as f32 * rect.width();
+                        let Some(x) = x_for_frame(frame) else {
+                            continue;
+                        };
                         let y = rect.bottom()
                             - observation.area as f32 / max_area.max(1) as f32 * rect.height();
                         points.push(egui::pos2(x, y));
@@ -2945,17 +3082,70 @@ impl GreenViewerApp {
                     for point in points {
                         painter.circle_filled(point, 3.0, color);
                     }
+
+                    if let Some(x) = x_for_frame(track.anchor_frame)
+                        && let Some(observation) = track.observations.get(&track.anchor_frame)
+                    {
+                        let y = rect.bottom()
+                            - observation.area as f32 / max_area.max(1) as f32 * rect.height();
+                        painter.circle_stroke(
+                            egui::pos2(x, y),
+                            6.0,
+                            egui::Stroke::new(2.0, color),
+                        );
+                    }
+                }
+
+                if let Some(sequence) = sequence
+                    && let Some(x) = x_for_frame(sequence.selected)
+                {
+                    let current_stroke =
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(245, 245, 245));
+                    let dash = 7.0;
+                    let gap = 5.0;
+                    let mut y = rect.top();
+                    while y < rect.bottom() {
+                        let y2 = (y + dash).min(rect.bottom());
+                        painter.line_segment(
+                            [egui::pos2(x, y), egui::pos2(x, y2)],
+                            current_stroke,
+                        );
+                        y += dash + gap;
+                    }
+                    if let Some(frame) = sequence.frames.get(sequence.selected) {
+                        painter.text(
+                            egui::pos2(x, rect.top() - 6.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format!(
+                                "F{} {}",
+                                sequence.selected.saturating_add(1),
+                                format_plot_axis_time(frame.timestamp, span)
+                            ),
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
                 }
 
                 ui.horizontal_wrapped(|ui| {
                     for track in self.shape_tracks.iter().filter(|track| track.enabled) {
                         let last = track.observations.last_key_value();
                         let suffix = last
-                            .map(|(_, observation)| format!("{} px · IoU {:.2}", observation.area, observation.overlap))
+                            .map(|(_, observation)| {
+                                format!("{} px · overlap {:.2}", observation.area, observation.overlap)
+                            })
                             .unwrap_or_else(|| "no sample".to_owned());
                         ui.colored_label(
                             track_color(track.id),
-                            format!("T{} {}: {}", track.id, track.name, suffix),
+                            format!(
+                                "T{} {}: {} · anchor F{} @ {},{}",
+                                track.id,
+                                track.name,
+                                suffix,
+                                track.anchor_frame.saturating_add(1),
+                                track.anchor_pivot.0,
+                                track.anchor_pivot.1
+                            ),
                         );
                     }
                 });
@@ -3069,10 +3259,12 @@ impl eframe::App for GreenViewerApp {
         egui::CentralPanel::default().show(ui, |ui| self.previews(ui));
 
         if let Some(response) = egui::Window::new("Controls / sequence")
+            .id(egui::Id::new("controls-sequence-window"))
             .default_pos(self.controls_window_pos)
             .default_size(self.controls_window_size)
             .current_pos(self.controls_window_pos)
             .min_size(egui::vec2(330.0, 320.0))
+            .constrain(false)
             .resizable([true, true])
             .hscroll(true)
             .vscroll(true)
@@ -3101,7 +3293,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.7.2")
+        .user_agent("rust-edge-gui/0.7.3")
         .build()
         .expect("failed to build HTTP client");
 
@@ -3722,6 +3914,96 @@ fn component_iou(a: &[u32], b: &[u32]) -> f32 {
     }
 }
 
+
+fn component_overlap_score(a: &[u32], b: &[u32]) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut ai = 0usize;
+    let mut bi = 0usize;
+    let mut intersection = 0usize;
+    while ai < a.len() && bi < b.len() {
+        match a[ai].cmp(&b[bi]) {
+            std::cmp::Ordering::Less => ai += 1,
+            std::cmp::Ordering::Greater => bi += 1,
+            std::cmp::Ordering::Equal => {
+                intersection += 1;
+                ai += 1;
+                bi += 1;
+            }
+        }
+    }
+    let containment = intersection as f32 / a.len().min(b.len()).max(1) as f32;
+    component_iou(a, b).max(containment)
+}
+
+fn centroid_distance_sq(a: (u32, u32), b: (u32, u32)) -> u64 {
+    let dx = a.0 as i64 - b.0 as i64;
+    let dy = a.1 as i64 - b.1 as i64;
+    (dx * dx + dy * dy) as u64
+}
+
+fn update_one_shape_track(
+    track: &mut ShapeTrack,
+    frame_index: usize,
+    width: usize,
+    components: &[MaskComponent],
+    threshold: f32,
+) {
+    if frame_index == track.anchor_frame {
+        return;
+    }
+
+    let Some((reference_frame_ref, reference_pixels)) = track
+        .matched_pixels
+        .iter()
+        .min_by_key(|(known_frame, _)| (**known_frame).abs_diff(frame_index))
+    else {
+        return;
+    };
+    let reference_frame = *reference_frame_ref;
+    let reference_centroid = track
+        .matched_centroids
+        .get(&reference_frame)
+        .copied()
+        .unwrap_or(track.anchor_pivot);
+
+    let mut best: Option<(&MaskComponent, f32, u64, (u32, u32))> = None;
+    for component in components {
+        let overlap = component_overlap_score(reference_pixels, &component.pixels);
+        let centroid = component_centroid(component, width);
+        let distance = centroid_distance_sq(reference_centroid, centroid);
+        let replace = match best {
+            None => true,
+            Some((_, best_overlap, best_distance, _)) => {
+                overlap > best_overlap + f32::EPSILON
+                    || ((overlap - best_overlap).abs() <= f32::EPSILON
+                        && distance < best_distance)
+            }
+        };
+        if replace {
+            best = Some((component, overlap, distance, centroid));
+        }
+    }
+
+    let Some((component, overlap, _, centroid)) = best else {
+        return;
+    };
+    if overlap + f32::EPSILON < threshold {
+        return;
+    }
+
+    track.observations.insert(
+        frame_index,
+        ShapeObservation {
+            area: component.area,
+            overlap,
+        },
+    );
+    track.matched_pixels.insert(frame_index, component.pixels.clone());
+    track.matched_centroids.insert(frame_index, centroid);
+}
+
 fn filter_mask_by_temporal_support(
     mask: &[bool],
     width: usize,
@@ -4061,6 +4343,17 @@ fn load_image_sequence(root: &Path) -> Result<ImageSequence> {
 fn format_absolute_time(time: SystemTime) -> String {
     let date_time: DateTime<Local> = time.into();
     date_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+fn format_plot_axis_time(time: SystemTime, span: Duration) -> String {
+    let date_time: DateTime<Local> = time.into();
+    if span >= Duration::from_secs(24 * 60 * 60) {
+        date_time.format("%m-%d %H:%M").to_string()
+    } else if span >= Duration::from_secs(60 * 60) {
+        date_time.format("%H:%M").to_string()
+    } else {
+        date_time.format("%H:%M:%S").to_string()
+    }
 }
 
 fn format_video_time(duration: Duration) -> String {

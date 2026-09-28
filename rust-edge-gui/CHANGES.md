@@ -1,5 +1,16 @@
 # Changes
 
+## 0.7.3
+
+- Backfill new shape tracks immediately from all compatible cached sequence masks; playback is no longer required to populate already-cached historical points.
+- Keep pivot frame, pivot pixel and anchor component immutable for every track.
+- Match outward from the nearest confirmed frame and use IoU/containment overlap plus centroid tie-breaking to tolerate mask growth/shrink without reference drift.
+- Render tracked-area plots against real absolute timestamps instead of uniform frame indices.
+- Add a dashed vertical current-frame marker and formatted local absolute-time X-axis ticks.
+- Fix plot-window vertical resizing by removing screen-sized `available_height()` canvas allocation.
+- Disable egui position clamping for persisted floating image/control/plot windows so saved positions restore exactly.
+- Bump package version to 0.7.3.
+
 ## 0.7.2
 
 - Fixed live-recording ghost frames: a frame is added to the active sequence only after its backing image has been saved successfully.

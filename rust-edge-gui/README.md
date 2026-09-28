@@ -1,7 +1,18 @@
-# rust-edge-gui 0.7.2
+# rust-edge-gui 0.7.3
 
 Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, native offline YOLO segmentation, per-window navigation, sequence playback, temporal false-positive filtering, and tracked mask-area plots.
 
+
+
+## What changed in 0.7.3
+
+- **Immediate historical pivot plot** — adding a pivot retroactively matches that anchored component against every compatible mask already present in the sequence cache. Old points no longer require replaying the sequence just to appear.
+- **Anchor-stable identity** — a track permanently remembers the frame, clicked pixel and original component where `P` was pressed. Matching propagates outward from that anchor through the nearest confirmed frame instead of overwriting one global reference and drifting.
+- **Growth/shrink tolerance** — same-shape matching uses the stronger of IoU and overlap relative to the smaller component, with centroid distance as a tie-breaker.
+- **Absolute-time plot** — plot X coordinates now use actual frame timestamps, including irregular capture gaps, with formatted local-time ticks.
+- **Current-frame marker** — the plot renders a dashed vertical line and `F# time` label for the frame currently shown by the sequence viewer.
+- **Resizable plot height** — plot canvas sizing follows the persisted/user-resized window rather than `available_height()`, which previously expanded the plot to screen height.
+- **Window-position restore** — floating controls, plot and image windows opt out of egui screen clamping so persisted coordinates are reapplied exactly on relaunch.
 
 ## What changed in 0.7.2
 
@@ -30,7 +41,7 @@ Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP 
 - **Floating scrollable controls** — controls, status and sequence transport live in one floating window instead of competing bottom/side panels.
 - **Sequence playback** — Play/Pause/Prev/Next, configurable playback FPS, loop mode and optional wait-for-processing mode.
 - **Tracked mask pivots** — while a sequence is open, hover a closed component in the Processed window and press `P`. The component becomes a tracked shape; its marker follows the matched component centroid on subsequent processed frames.
-- **Cross-frame shape matching** — tracked components are associated frame-to-frame by configurable mask IoU.
+- **Cross-frame shape matching** — tracked components are associated frame-to-frame by configurable mask overlap.
 - **Floating size plot** — tracked component area (pixels) is plotted against sequence frame as masks are processed.
 - **Temporal false-positive filter** — optionally require a component to overlap masks in surrounding cached frames before it is rendered in the final processed image. Configure temporal window `n`, required confirmations and overlap threshold.
 
@@ -39,7 +50,7 @@ Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP 
 1. Open an image sequence.
 2. Leave **Wait for processing** enabled and press **Play** to process frames sequentially.
 3. In the **Processed** window, hover the plant/leaf component and press `P`.
-4. Adjust **Same-shape IoU** if the shape grows or moves enough to break matching.
+4. Adjust **Same-shape overlap** if the shape grows or moves enough to break matching.
 5. Open **Tracked mask size** to see the area curve.
 6. For temporal cleanup, enable **Filter transient components using surrounding frames**. For temporal window `n`, the app uses `floor(n/2)-1` cached frames before and after the current frame. Play/analyze the sequence to populate the cache, then scrub/replay for the full symmetric filter.
 
