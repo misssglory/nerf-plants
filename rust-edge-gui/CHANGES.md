@@ -1,5 +1,15 @@
 # Changes
 
+## 0.7.5
+
+- Lower the tracked-size plot hard minimum and make help/legend responsive so the plot window can be resized much smaller vertically without content forcing it open again.
+- Automatically add one pivot at the centroid of every closed connected mask component in sequence frame 1. Components touching the image border are excluded from auto-seeding.
+- Add permanent collision grouping: if independent tracks ever resolve to the same connected component, they are merged into one logical group for every frame.
+- Plot merged groups as the union of member pixels per frame, avoiding double-counting during collisions while preserving combined area before/after the collision.
+- Render one grouped pivot/overlay for collided shapes; pressing `P` on that grouped pivot removes the whole merged group.
+- Add `Continue active sequence` capture mode. New frames are appended to the currently open sequence, frame numbering continues from existing files, and existing tracking/history is preserved.
+- Bump package version to 0.7.5.
+
 ## 0.7.4
 
 - Fix tracked-size plot height feedback: plot canvas now follows the current visible window body instead of the previous persisted outer size, and the track legend no longer wraps vertically.

@@ -1,9 +1,17 @@
-# rust-edge-gui 0.7.4
+# rust-edge-gui 0.7.5
 
 Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, native offline YOLO segmentation, per-window navigation, sequence playback, temporal false-positive filtering, and tracked mask-area plots.
 
 
 
+
+## What changed in 0.7.5
+
+- **Smaller plot window** — the tracked-area plot can now be resized down to a compact height; help text and the legend disappear adaptively instead of imposing a content-driven minimum.
+- **Automatic pivots** — when frame 1 of a sequence is processed, every closed connected mask component receives a pivot automatically at its centroid. Mask blobs touching the image border are not auto-seeded.
+- **Collision groups** — if two or more tracked shapes merge into one connected mask component in any frame, they permanently become one logical group. The plot uses the union of their pixels in every frame, so a collision is not double-counted and the relationship is applied retroactively.
+- **Grouped overlays** — collided members render as one group pivot/label. Hovering that marker still highlights it yellow; `P` removes the whole group.
+- **Continue an existing recording** — open a sequence and use **Continue active sequence** under Continuous capture. New frames are appended to that sequence with numbering continued from the largest existing `frame_XXXXXX` index; existing pivots, groups and history stay intact.
 
 ## What changed in 0.7.4
 
@@ -56,9 +64,9 @@ Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP 
 
 ### Sequence tracking workflow
 
-1. Open an image sequence.
+1. Open an image sequence. Frame 1 automatically seeds pivots for all closed mask components once processing finishes.
 2. Leave **Wait for processing** enabled and press **Play** to process frames sequentially.
-3. In the **Processed** window, hover the plant/leaf component and press `P`.
+3. You can still add/remove pivots manually in the **Processed** window with `P`; collided tracks are permanently grouped.
 4. Adjust **Same-shape overlap** if the shape grows or moves enough to break matching.
 5. Open **Tracked mask size** to see the area curve.
 6. For temporal cleanup, enable **Filter transient components using surrounding frames**. For temporal window `n`, the app uses `floor(n/2)-1` cached frames before and after the current frame. Play/analyze the sequence to populate the cache, then scrub/replay for the full symmetric filter.

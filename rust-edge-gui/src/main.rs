@@ -1,7 +1,7 @@
 mod viewer;
 mod yolo;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -20,7 +20,7 @@ use yolo::{
     YoloRuntimeSettings, YoloWorker,
 };
 
-const APP_TITLE: &str = "Rust Edge GUI v0.7.4 — Interactive Shape Tracking";
+const APP_TITLE: &str = "Rust Edge GUI v0.7.5 — Auto Shape Groups";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -501,6 +501,9 @@ struct ShapeObservation {
 
 struct ShapeTrack {
     id: u64,
+    /// Permanent group identity. Tracks are grouped when their masks collide into
+    /// the same connected component in any frame. Grouping is retroactive.
+    group_id: u64,
     name: String,
     /// Immutable identity anchor: the exact user-picked pixel and frame.
     /// Tracking may adapt to mask growth/shrink, but never rewrites this origin.
@@ -515,6 +518,17 @@ struct ShapeTrack {
     matched_centroids: BTreeMap<usize, (u32, u32)>,
     observations: BTreeMap<usize, ShapeObservation>,
     enabled: bool,
+}
+
+
+#[derive(Clone, Debug)]
+struct ShapeGroupSeries {
+    id: u64,
+    name: String,
+    member_count: usize,
+    anchor_frame: usize,
+    areas: BTreeMap<usize, usize>,
+    centroids: BTreeMap<usize, (u32, u32)>,
 }
 
 struct CaptureSession {
@@ -602,6 +616,9 @@ struct GreenViewerApp {
     track_overlap_threshold: f32,
     shape_tracks: Vec<ShapeTrack>,
     next_track_id: u64,
+    /// Set whenever a new sequence is opened/started. The first processed frame
+    /// seeds one pivot for every closed connected mask component automatically.
+    auto_seed_pivots_pending: bool,
     shape_plot_open: bool,
     plot_click_seek_enabled: bool,
     sequence_playing: bool,
@@ -781,6 +798,7 @@ impl GreenViewerApp {
             track_overlap_threshold: if persisted_v2 { persisted.track_overlap_threshold.clamp(0.0, 1.0) } else { 0.30 },
             shape_tracks: Vec::new(),
             next_track_id: 0,
+            auto_seed_pivots_pending: false,
             shape_plot_open: if persisted_v2 { persisted.shape_plot_open } else { false },
             plot_click_seek_enabled: if persisted_v3 { persisted.plot_click_seek_enabled } else { true },
             sequence_playing: false,
@@ -1122,6 +1140,7 @@ impl GreenViewerApp {
                 self.sequence_mask_cache.clear();
                 self.sequence_mask_cache_order.clear();
                 self.shape_tracks.clear();
+                self.auto_seed_pivots_pending = true;
                 self.shape_plot_open = false;
                 self.remember_sequence(root_label.clone());
                 self.status = format!("Opened image sequence {root_label}");
@@ -1242,6 +1261,100 @@ impl GreenViewerApp {
         }
     }
 
+    fn continue_continuous_capture_in_active_sequence(&mut self) {
+        if !self.capture_save_original && !self.capture_save_processed {
+            self.error = Some("Enable original and/or processed capture saving first.".to_owned());
+            return;
+        }
+        let Some((root, frames)) = self
+            .active_sequence
+            .as_ref()
+            .map(|sequence| (sequence.root.clone(), sequence.frames.clone()))
+        else {
+            self.error = Some("Open an existing image sequence first.".to_owned());
+            return;
+        };
+
+        let address = self.url_input.trim().to_owned();
+        let url = match normalize_camera_address(&address) {
+            Ok(url) => url,
+            Err(error) => {
+                self.error = Some(format!("Invalid camera address: {error:#}"));
+                return;
+            }
+        };
+
+        self.capture_interval_secs = self
+            .capture_interval_secs
+            .max(MIN_CAPTURE_INTERVAL_SECONDS);
+        let original_dir = root.join("original");
+        let processed_dir = root.join("processed");
+        let create_result = (|| -> Result<()> {
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("cannot create {}", root.display()))?;
+            if self.capture_save_original {
+                std::fs::create_dir_all(&original_dir)
+                    .with_context(|| format!("cannot create {}", original_dir.display()))?;
+            }
+            if self.capture_save_processed {
+                std::fs::create_dir_all(&processed_dir)
+                    .with_context(|| format!("cannot create {}", processed_dir.display()))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = create_result {
+            self.error = Some(format!("Failed to continue capture: {error:#}"));
+            return;
+        }
+
+        let mut max_index = 0u64;
+        for frame in &frames {
+            let Some(name) = frame.path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix("frame_") else {
+                continue;
+            };
+            let digits = rest.split('_').next().unwrap_or_default();
+            if let Ok(index) = digits.parse::<u64>() {
+                max_index = max_index.max(index);
+            }
+        }
+        let next_frame_index = max_index
+            .max(frames.len() as u64)
+            .saturating_add(1)
+            .max(1);
+
+        self.capture_session = Some(CaptureSession {
+            root: root.clone(),
+            original_dir,
+            processed_dir,
+            next_frame_index,
+        });
+        self.capture_url = Some(url);
+        self.pending_capture = None;
+        self.processing_capture = None;
+        self.deferred_sequence_frame = None;
+        self.next_capture_due = Some(Instant::now());
+        self.continuous_capture = true;
+        self.sequence_playing = false;
+        self.next_sequence_frame_due = None;
+        // Existing pivots/groups and cached history stay intact. If this sequence
+        // somehow has no pivots yet, the next frame-1 analysis can still seed them.
+        if self.shape_tracks.is_empty() && frames.is_empty() {
+            self.auto_seed_pivots_pending = true;
+        }
+        self.remember_sequence(root.display().to_string());
+        self.save_preferences();
+        self.status = format!(
+            "Continuing capture in existing sequence: every {:.3}s → {} (next frame {:06})",
+            self.capture_interval_secs,
+            root.display(),
+            next_frame_index
+        );
+        self.error = None;
+    }
+
     fn start_continuous_capture(&mut self) {
         if !self.capture_save_original && !self.capture_save_processed {
             self.error = Some("Enable original and/or processed capture saving first.".to_owned());
@@ -1308,6 +1421,7 @@ impl GreenViewerApp {
         self.sequence_mask_cache.clear();
         self.sequence_mask_cache_order.clear();
         self.shape_tracks.clear();
+        self.auto_seed_pivots_pending = true;
         self.capture_url = Some(url);
         self.pending_capture = None;
         self.processing_capture = None;
@@ -1759,6 +1873,12 @@ impl GreenViewerApp {
                             result.height,
                             Arc::clone(&frame_mask),
                         );
+                        self.seed_all_shapes_from_mask(
+                            frame_index,
+                            result.width,
+                            result.height,
+                            frame_mask.as_ref(),
+                        );
                         self.update_shape_tracks_for_frame(
                             frame_index,
                             result.width,
@@ -1889,6 +2009,123 @@ impl GreenViewerApp {
             }
             update_one_shape_track(track, frame_index, width, &components, threshold);
         }
+        self.merge_colliding_shape_groups(frame_index);
+    }
+
+    /// Permanently merge track groups when two previously independent shapes
+    /// resolve to the same connected component in a frame. Group membership is
+    /// then used retroactively by overlays and the plot, so separated components
+    /// before/after the collision are still treated as one logical shape.
+    fn merge_colliding_shape_groups(&mut self, frame_index: usize) {
+        let mut merges = Vec::<(usize, usize)>::new();
+        for a in 0..self.shape_tracks.len() {
+            if !self.shape_tracks[a].enabled {
+                continue;
+            }
+            let Some(a_pixels) = self.shape_tracks[a].matched_pixels.get(&frame_index) else {
+                continue;
+            };
+            for b in (a + 1)..self.shape_tracks.len() {
+                if !self.shape_tracks[b].enabled {
+                    continue;
+                }
+                if self.shape_tracks[a].group_id == self.shape_tracks[b].group_id {
+                    continue;
+                }
+                let Some(b_pixels) = self.shape_tracks[b].matched_pixels.get(&frame_index) else {
+                    continue;
+                };
+                // If both tracks selected exactly the same connected component,
+                // the physical shapes have collided/merged in this frame.
+                if a_pixels == b_pixels {
+                    merges.push((a, b));
+                }
+            }
+        }
+
+        // Apply by track indices rather than stale group IDs so transitive
+        // collisions A↔B and B↔C collapse to one canonical group in one pass.
+        for (a, b) in merges {
+            let ga = self.shape_tracks[a].group_id;
+            let gb = self.shape_tracks[b].group_id;
+            if ga == gb {
+                continue;
+            }
+            let target = ga.min(gb);
+            for track in &mut self.shape_tracks {
+                if track.group_id == ga || track.group_id == gb {
+                    track.group_id = target;
+                }
+            }
+        }
+    }
+
+    fn seed_all_shapes_from_mask(
+        &mut self,
+        frame_index: usize,
+        width: usize,
+        height: usize,
+        mask: &[bool],
+    ) {
+        if !self.auto_seed_pivots_pending || frame_index != 0 || !self.shape_tracks.is_empty() {
+            return;
+        }
+        let components = extract_mask_components(mask, width, height)
+            .into_iter()
+            .filter(|component| component_is_closed(component, width, height))
+            .collect::<Vec<_>>();
+        if components.is_empty() {
+            self.auto_seed_pivots_pending = false;
+            return;
+        }
+
+        let mut created = Vec::with_capacity(components.len());
+        for component in components {
+            self.next_track_id = self.next_track_id.wrapping_add(1).max(1);
+            let track_id = self.next_track_id;
+            let pivot = component_centroid(&component, width);
+            let anchor_pixels = component.pixels;
+            let mut observations = BTreeMap::new();
+            observations.insert(
+                frame_index,
+                ShapeObservation {
+                    area: component.area,
+                    overlap: 1.0,
+                },
+            );
+            let mut matched_pixels = BTreeMap::new();
+            matched_pixels.insert(frame_index, anchor_pixels.clone());
+            let mut matched_centroids = BTreeMap::new();
+            matched_centroids.insert(frame_index, pivot);
+            self.shape_tracks.push(ShapeTrack {
+                id: track_id,
+                group_id: track_id,
+                name: format!("shape-{track_id}"),
+                anchor_pivot: pivot,
+                anchor_frame: frame_index,
+                anchor_width: width,
+                anchor_height: height,
+                anchor_pixels,
+                matched_pixels,
+                matched_centroids,
+                observations,
+                enabled: true,
+            });
+            created.push(track_id);
+        }
+        self.auto_seed_pivots_pending = false;
+        self.shape_plot_open = !created.is_empty();
+        for track_id in created.iter().copied() {
+            self.rebuild_shape_track_from_cached_masks(track_id);
+        }
+        let cached_frames = self.sequence_mask_cache.keys().copied().collect::<Vec<_>>();
+        for frame in cached_frames {
+            self.merge_colliding_shape_groups(frame);
+        }
+        self.status = format!(
+            "Automatically added {} pivot(s) from closed shapes in sequence frame 1.",
+            created.len()
+        );
     }
 
     fn rebuild_shape_track_from_cached_masks(&mut self, track_id: u64) {
@@ -2000,6 +2237,7 @@ impl GreenViewerApp {
 
         self.shape_tracks.push(ShapeTrack {
             id: track_id,
+            group_id: track_id,
             name: format!("shape-{track_id}"),
             anchor_pivot: pixel,
             anchor_frame: frame_index,
@@ -2012,6 +2250,10 @@ impl GreenViewerApp {
             enabled: true,
         });
         self.rebuild_shape_track_from_cached_masks(track_id);
+        let cached_frames = self.sequence_mask_cache.keys().copied().collect::<Vec<_>>();
+        for frame in cached_frames {
+            self.merge_colliding_shape_groups(frame);
+        }
         self.shape_plot_open = true;
         let samples = self
             .shape_tracks
@@ -2030,22 +2272,30 @@ impl GreenViewerApp {
 
     fn track_overlays(&self) -> Vec<viewer::OverlayPoint> {
         let current_frame = self.active_sequence.as_ref().map(|sequence| sequence.selected);
-        self.shape_tracks
-            .iter()
-            .filter(|track| track.enabled)
-            .map(|track| {
+        let width = self
+            .original_rgba
+            .as_ref()
+            .map(|image| image.width() as usize)
+            .unwrap_or(0);
+        build_shape_group_series(&self.shape_tracks, width)
+            .into_iter()
+            .map(|group| {
                 let pixel = current_frame
-                    .and_then(|frame| track.matched_centroids.get(&frame).copied())
-                    .unwrap_or(track.anchor_pivot);
+                    .and_then(|frame| group.centroids.get(&frame).copied())
+                    .or_else(|| group.centroids.get(&group.anchor_frame).copied())
+                    .unwrap_or((0, 0));
+                let label = if group.member_count > 1 {
+                    format!("G{} ({} shapes)", group.id, group.member_count)
+                } else if current_frame == Some(group.anchor_frame) {
+                    format!("T{} anchor", group.id)
+                } else {
+                    format!("T{}", group.id)
+                };
                 viewer::OverlayPoint {
-                    id: Some(track.id),
+                    id: Some(group.id),
                     pixel,
-                    color: track_color(track.id),
-                    label: if current_frame == Some(track.anchor_frame) {
-                        format!("T{} anchor", track.id)
-                    } else {
-                        format!("T{}", track.id)
-                    },
+                    color: track_color(group.id),
+                    label,
                 }
             })
             .collect()
@@ -2375,10 +2625,21 @@ impl GreenViewerApp {
                 ui.checkbox(&mut self.capture_save_processed, "Processed");
             });
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if !self.continuous_capture {
-                if ui.button("Start continuous capture").clicked() {
+                if ui.button("Start new capture sequence").clicked() {
                     self.start_continuous_capture();
+                    ui.ctx().request_repaint();
+                }
+                if ui
+                    .add_enabled(
+                        self.active_sequence.is_some(),
+                        egui::Button::new("Continue active sequence"),
+                    )
+                    .on_hover_text("Append new captured frames to the currently open sequence")
+                    .clicked()
+                {
+                    self.continue_continuous_capture_in_active_sequence();
                     ui.ctx().request_repaint();
                 }
             } else if ui.button("Stop capture").clicked() {
@@ -2392,7 +2653,7 @@ impl GreenViewerApp {
         if let Some(session) = self.capture_session.as_ref() {
             ui.small(format!("Session: {}", session.root.display()));
         }
-        ui.small("Capture acquisition is independent from mask processing: raw originals keep the requested interval even if YOLO/temporal processing is slower. If only Processed saving is enabled, frames can be skipped when processing cannot keep up.");
+        ui.small("Start new creates a fresh capture folder. Continue active sequence appends new frames to the currently open sequence and preserves its history/tracking. Capture acquisition is independent from mask processing: raw originals keep the requested interval even if YOLO/temporal processing is slower.");
 
         ui.separator();
         ui.collapsing("Image windows", |ui| {
@@ -2841,9 +3102,13 @@ impl GreenViewerApp {
                 for track_id in track_ids {
                     self.rebuild_shape_track_from_cached_masks(track_id);
                 }
+                let cached_frames = self.sequence_mask_cache.keys().copied().collect::<Vec<_>>();
+                for frame in cached_frames {
+                    self.merge_colliding_shape_groups(frame);
+                }
                 self.save_preferences();
             }
-            ui.small("Hover a closed component in Processed and press P. The clicked pixel + frame become an immutable identity anchor; matching then propagates outward through neighbouring cached masks. Hover an existing pivot (yellow) and press P to remove it.");
+            ui.small("Frame 1 seeds closed components automatically. P remains available for manual add/remove: the clicked pixel + frame become an immutable identity anchor; hover an existing pivot (yellow) and press P to remove it.");
             if ui
                 .checkbox(&mut self.plot_click_seek_enabled, "Click plot X-axis to seek frame")
                 .changed()
@@ -2917,6 +3182,7 @@ impl GreenViewerApp {
             ui.small("Temporal filtering uses cached masks on both sides of the current frame. Playing/analyzing the sequence populates the cache; edge frames naturally have fewer neighbours.");
 
             ui.separator();
+            ui.small("Frame 1 auto-seeds one pivot for every closed mask component. If pivots ever resolve to the same component, their groups merge permanently and are plotted as one union shape.");
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!self.shape_tracks.is_empty(), egui::Button::new("Open size plot"))
@@ -2931,11 +3197,23 @@ impl GreenViewerApp {
                     self.shape_tracks.clear();
                 }
             });
+            let mut group_counts = BTreeMap::<u64, usize>::new();
+            for track in &self.shape_tracks {
+                *group_counts.entry(track.group_id).or_default() += 1;
+            }
             let mut remove_track = None;
             for (index, track) in self.shape_tracks.iter_mut().enumerate() {
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut track.enabled, "");
-                    ui.colored_label(track_color(track.id), format!("T{}", track.id));
+                    let grouped = group_counts.get(&track.group_id).copied().unwrap_or(1);
+                    ui.colored_label(
+                        track_color(track.group_id),
+                        if grouped > 1 {
+                            format!("G{} / T{}", track.group_id, track.id)
+                        } else {
+                            format!("T{}", track.id)
+                        },
+                    );
                     ui.text_edit_singleline(&mut track.name);
                     ui.monospace(format!(
                         "{} samples · anchor f{} @ {},{}",
@@ -2982,10 +3260,16 @@ impl GreenViewerApp {
             &mut self.processed_view,
             egui::pos2(900.0, 100.0),
         );
-        if let Some(track_id) = processed_interaction.toggle_overlay_id {
-            if let Some(index) = self.shape_tracks.iter().position(|track| track.id == track_id) {
-                self.shape_tracks.remove(index);
-                self.status = format!("Removed tracked pivot T{track_id}.");
+        if let Some(group_id) = processed_interaction.toggle_overlay_id {
+            let before = self.shape_tracks.len();
+            self.shape_tracks.retain(|track| track.group_id != group_id);
+            let removed = before.saturating_sub(self.shape_tracks.len());
+            if removed > 0 {
+                self.status = if removed == 1 {
+                    format!("Removed tracked pivot T{group_id}.")
+                } else {
+                    format!("Removed merged shape group G{group_id} ({removed} pivots).")
+                };
                 if self.shape_tracks.is_empty() {
                     self.shape_plot_open = false;
                 }
@@ -3013,61 +3297,92 @@ impl GreenViewerApp {
 
         let mut open = self.shape_plot_open;
         let mut seek_frame = None;
+        let image_width = self
+            .original_rgba
+            .as_ref()
+            .map(|image| image.width() as usize)
+            .unwrap_or(0);
+        let groups = build_shape_group_series(&self.shape_tracks, image_width);
+        let sequence_times = self
+            .active_sequence
+            .as_ref()
+            .map(|sequence| sequence.frames.iter().map(|frame| frame.timestamp).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let selected_frame = self.active_sequence.as_ref().map(|sequence| sequence.selected);
+        let click_seek_enabled = self.plot_click_seek_enabled;
+        let fallback_size = self.shape_plot_window_size;
+
         let response = egui::Window::new("Tracked mask size")
             .id(egui::Id::new("tracked-mask-size-window"))
             .open(&mut open)
             .default_pos(self.shape_plot_window_pos)
             .default_size(self.shape_plot_window_size)
             .current_pos(self.shape_plot_window_pos)
-            .min_size(egui::vec2(420.0, 240.0))
+            // Keep the hard floor intentionally tiny. Plot chrome adapts to the
+            // current body size instead of forcing the window back open.
+            .min_size(egui::vec2(160.0, 58.0))
             .constrain(false)
             .resizable([true, true])
             .show(ctx, |ui| {
-                ui.small("X = absolute capture time · Y = mask area in pixels. Dashed line = current frame. Space = play/pause.");
-
-                // Keep the legend on exactly one row. The previous wrapped legend
-                // changed the content height when a second pivot was added; because
-                // the canvas height was derived from the previous outer window size,
-                // that created a positive resize feedback loop.
-                ui.horizontal(|ui| {
-                    ui.monospace("Tracks:");
-                    for track in self.shape_tracks.iter().filter(|track| track.enabled) {
-                        let last = track.observations.last_key_value();
-                        let suffix = last
-                            .map(|(_, observation)| format!("{} px / {:.2}", observation.area, observation.overlap))
-                            .unwrap_or_else(|| "no sample".to_owned());
-                        ui.colored_label(
-                            track_color(track.id),
-                            format!("T{} {} [{}]", track.id, track.name, suffix),
-                        );
-                        ui.separator();
-                    }
-                });
-
-                // Use the ACTUAL visible body rectangle of the window in this frame,
-                // rather than the persisted outer size from the previous frame. This
-                // makes vertical resizing stable in both directions and prevents both
-                // the minimum-height collapse and unbounded growth feedback.
-                let visible = ui.available_rect_before_wrap().intersect(ui.clip_rect());
-                let plot_width = if visible.width().is_finite() {
-                    visible.width().max(360.0)
+                ui.set_min_size(egui::Vec2::ZERO);
+                let initial_h = ui.available_height();
+                let body_h = if initial_h.is_finite() {
+                    initial_h
                 } else {
-                    620.0
+                    (fallback_size.y - 34.0).max(48.0)
                 };
-                let plot_height = if visible.height().is_finite() {
-                    visible.height().max(130.0)
+
+                if body_h > 135.0 {
+                    ui.small("X = absolute capture time · Y = grouped mask area. Shapes that ever collide are permanently grouped. Dashed line = current frame.");
+                }
+                if body_h > 95.0 {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("shape-plot-legend")
+                        .max_height(22.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.monospace("Groups:");
+                                for group in &groups {
+                                    let last = group.areas.last_key_value();
+                                    let suffix = last
+                                        .map(|(_, area)| format!("{} px", area))
+                                        .unwrap_or_else(|| "no sample".to_owned());
+                                    let prefix = if group.member_count > 1 { "G" } else { "T" };
+                                    ui.colored_label(
+                                        track_color(group.id),
+                                        format!("{}{} {} [{}]", prefix, group.id, group.name, suffix),
+                                    );
+                                    ui.separator();
+                                }
+                            });
+                        });
+                }
+
+                let available = ui.available_size();
+                let plot_width = if available.x.is_finite() {
+                    available.x.max(120.0)
                 } else {
-                    260.0
+                    fallback_size.x.max(220.0) - 12.0
                 };
-                let sense = if self.plot_click_seek_enabled {
+                let plot_height = if available.y.is_finite() {
+                    available.y.max(12.0)
+                } else {
+                    (fallback_size.y - 70.0).max(12.0)
+                };
+                let sense = if click_seek_enabled {
                     egui::Sense::click()
                 } else {
                     egui::Sense::hover()
                 };
                 let (plot_response, painter) =
                     ui.allocate_painter(egui::vec2(plot_width, plot_height), sense);
-                let rect = plot_response.rect.shrink2(egui::vec2(58.0, 32.0));
-                if rect.width() <= 1.0 || rect.height() <= 1.0 {
+
+                let horizontal_margin = if plot_width > 260.0 { 52.0 } else if plot_width > 150.0 { 24.0 } else { 4.0 };
+                let vertical_margin = if plot_height > 95.0 { 27.0 } else if plot_height > 40.0 { 10.0 } else { 1.0 };
+                let rect = plot_response
+                    .rect
+                    .shrink2(egui::vec2(horizontal_margin, vertical_margin));
+                if rect.width() <= 2.0 || rect.height() <= 2.0 {
                     return;
                 }
 
@@ -3077,35 +3392,24 @@ impl GreenViewerApp {
                 painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
                 painter.line_segment([rect.left_bottom(), rect.left_top()], border);
 
-                let mut max_area = 1usize;
-                for track in self.shape_tracks.iter().filter(|track| track.enabled) {
-                    max_area = max_area.max(
-                        track
-                            .observations
-                            .values()
-                            .map(|observation| observation.area)
-                            .max()
-                            .unwrap_or(1),
-                    );
-                }
+                let max_area = groups
+                    .iter()
+                    .flat_map(|group| group.areas.values().copied())
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
 
-                let sequence = self.active_sequence.as_ref();
-                let (start_time, end_time) = sequence
-                    .and_then(|sequence| {
-                        Some((
-                            sequence.frames.first()?.timestamp,
-                            sequence.frames.last()?.timestamp,
-                        ))
-                    })
-                    .unwrap_or((UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(1)));
+                let (start_time, end_time) = match (sequence_times.first(), sequence_times.last()) {
+                    (Some(start), Some(end)) => (*start, *end),
+                    _ => (UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(1)),
+                };
                 let span = end_time
                     .duration_since(start_time)
                     .unwrap_or(Duration::from_secs(1))
                     .max(Duration::from_millis(1));
 
                 let x_for_frame = |frame: usize| -> Option<f32> {
-                    let sequence = sequence?;
-                    let timestamp = sequence.frames.get(frame)?.timestamp;
+                    let timestamp = *sequence_times.get(frame)?;
                     let offset = timestamp.duration_since(start_time).ok()?;
                     Some(
                         rect.left()
@@ -3113,105 +3417,97 @@ impl GreenViewerApp {
                     )
                 };
 
-                for step in 0..=4 {
-                    let t = step as f32 / 4.0;
+                let grid_steps = if rect.height() > 85.0 { 4 } else { 2 };
+                for step in 0..=grid_steps {
+                    let t = step as f32 / grid_steps.max(1) as f32;
                     let y = egui::lerp(rect.bottom()..=rect.top(), t);
                     painter.line_segment(
                         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                         egui::Stroke::new(0.5, egui::Color32::from_gray(45)),
                     );
-                    painter.text(
-                        egui::pos2(rect.left() - 7.0, y),
-                        egui::Align2::RIGHT_CENTER,
-                        format!("{} px", (max_area as f32 * t).round() as usize),
-                        egui::FontId::monospace(10.0),
-                        egui::Color32::GRAY,
-                    );
+                    if rect.height() > 55.0 {
+                        painter.text(
+                            egui::pos2(rect.left() - 5.0, y),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("{}", (max_area as f32 * t).round() as usize),
+                            egui::FontId::monospace(9.0),
+                            egui::Color32::GRAY,
+                        );
+                    }
                 }
 
-                for step in 0..=4 {
-                    let t = step as f64 / 4.0;
+                let time_steps = if rect.width() > 520.0 { 4 } else if rect.width() > 300.0 { 2 } else { 1 };
+                for step in 0..=time_steps {
+                    let t = step as f64 / time_steps.max(1) as f64;
                     let tick_time = start_time + Duration::from_secs_f64(span.as_secs_f64() * t);
                     let x = egui::lerp(rect.left()..=rect.right(), t as f32);
                     painter.line_segment(
                         [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                         egui::Stroke::new(0.5, egui::Color32::from_gray(35)),
                     );
-                    painter.text(
-                        egui::pos2(x, rect.bottom() + 8.0),
-                        egui::Align2::CENTER_TOP,
-                        format_plot_axis_time(tick_time, span),
-                        egui::FontId::monospace(10.0),
-                        egui::Color32::GRAY,
-                    );
+                    if rect.width() > 180.0 && plot_height > 48.0 {
+                        painter.text(
+                            egui::pos2(x, rect.bottom() + 5.0),
+                            egui::Align2::CENTER_TOP,
+                            format_plot_axis_time(tick_time, span),
+                            egui::FontId::monospace(9.0),
+                            egui::Color32::GRAY,
+                        );
+                    }
                 }
 
-                for track in self.shape_tracks.iter().filter(|track| track.enabled) {
-                    let color = track_color(track.id);
+                for group in &groups {
+                    let color = track_color(group.id);
                     let mut points = Vec::new();
-                    for (&frame, observation) in &track.observations {
-                        let Some(x) = x_for_frame(frame) else {
-                            continue;
-                        };
-                        let y = rect.bottom()
-                            - observation.area as f32 / max_area.max(1) as f32 * rect.height();
+                    for (&frame, &area) in &group.areas {
+                        let Some(x) = x_for_frame(frame) else { continue; };
+                        let y = rect.bottom() - area as f32 / max_area as f32 * rect.height();
                         points.push(egui::pos2(x, y));
                     }
                     for pair in points.windows(2) {
                         painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0, color));
                     }
                     for point in points {
-                        painter.circle_filled(point, 3.0, color);
+                        painter.circle_filled(point, 2.8, color);
                     }
-
-                    if let Some(x) = x_for_frame(track.anchor_frame)
-                        && let Some(observation) = track.observations.get(&track.anchor_frame)
+                    if let Some(x) = x_for_frame(group.anchor_frame)
+                        && let Some(area) = group.areas.get(&group.anchor_frame)
                     {
-                        let y = rect.bottom()
-                            - observation.area as f32 / max_area.max(1) as f32 * rect.height();
+                        let y = rect.bottom() - *area as f32 / max_area as f32 * rect.height();
                         painter.circle_stroke(
                             egui::pos2(x, y),
-                            6.0,
-                            egui::Stroke::new(2.0, color),
+                            5.5,
+                            egui::Stroke::new(1.8, color),
                         );
                     }
                 }
 
-                if let Some(sequence) = sequence
-                    && let Some(x) = x_for_frame(sequence.selected)
+                if let Some(frame_index) = selected_frame
+                    && let Some(x) = x_for_frame(frame_index)
                 {
-                    let current_stroke =
-                        egui::Stroke::new(1.5, egui::Color32::from_rgb(245, 245, 245));
-                    let dash = 7.0;
-                    let gap = 5.0;
+                    let stroke = egui::Stroke::new(1.4, egui::Color32::WHITE);
                     let mut y = rect.top();
                     while y < rect.bottom() {
-                        let y2 = (y + dash).min(rect.bottom());
-                        painter.line_segment(
-                            [egui::pos2(x, y), egui::pos2(x, y2)],
-                            current_stroke,
-                        );
-                        y += dash + gap;
+                        let y2 = (y + 6.0).min(rect.bottom());
+                        painter.line_segment([egui::pos2(x, y), egui::pos2(x, y2)], stroke);
+                        y += 10.0;
                     }
-                    if let Some(frame) = sequence.frames.get(sequence.selected) {
+                    if plot_height > 62.0
+                        && let Some(timestamp) = sequence_times.get(frame_index)
+                    {
                         painter.text(
-                            egui::pos2(x, rect.top() - 6.0),
+                            egui::pos2(x, rect.top() - 4.0),
                             egui::Align2::CENTER_BOTTOM,
-                            format!(
-                                "F{} {}",
-                                sequence.selected.saturating_add(1),
-                                format_plot_axis_time(frame.timestamp, span)
-                            ),
-                            egui::FontId::monospace(10.0),
+                            format!("F{} {}", frame_index + 1, format_plot_axis_time(*timestamp, span)),
+                            egui::FontId::monospace(9.0),
                             egui::Color32::WHITE,
                         );
                     }
                 }
 
-                if self.plot_click_seek_enabled {
-                    // Treat the lower strip around the X-axis as the seek target.
+                if click_seek_enabled {
                     let axis_hit = egui::Rect::from_min_max(
-                        egui::pos2(rect.left(), rect.bottom() - 10.0),
+                        egui::pos2(rect.left(), (rect.bottom() - 8.0).max(rect.top())),
                         egui::pos2(rect.right(), plot_response.rect.bottom()),
                     );
                     if let Some(pointer) = plot_response.hover_pos()
@@ -3220,25 +3516,21 @@ impl GreenViewerApp {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                     if plot_response.clicked()
+                        && !sequence_times.is_empty()
                         && let Some(pointer) = plot_response.interact_pointer_pos()
                         && axis_hit.contains(pointer)
-                        && let Some(sequence) = sequence
-                        && !sequence.frames.is_empty()
                     {
                         let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
                         let target_offset = span.as_secs_f64() * fraction as f64;
-                        seek_frame = sequence
-                            .frames
+                        seek_frame = sequence_times
                             .iter()
                             .enumerate()
                             .min_by(|(_, a), (_, b)| {
                                 let a_offset = a
-                                    .timestamp
                                     .duration_since(start_time)
                                     .unwrap_or_default()
                                     .as_secs_f64();
                                 let b_offset = b
-                                    .timestamp
                                     .duration_since(start_time)
                                     .unwrap_or_default()
                                     .as_secs_f64();
@@ -3399,7 +3691,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.7.4")
+        .user_agent("rust-edge-gui/0.7.5")
         .build()
         .expect("failed to build HTTP client");
 
@@ -3979,6 +4271,18 @@ fn extract_mask_components(mask: &[bool], width: usize, height: usize) -> Vec<Ma
     components
 }
 
+fn component_is_closed(component: &MaskComponent, width: usize, height: usize) -> bool {
+    if component.pixels.is_empty() || width < 2 || height < 2 {
+        return false;
+    }
+    component.pixels.iter().all(|&index| {
+        let index = index as usize;
+        let x = index % width;
+        let y = index / width;
+        x > 0 && y > 0 && x + 1 < width && y + 1 < height
+    })
+}
+
 fn component_centroid(component: &MaskComponent, width: usize) -> (u32, u32) {
     if component.pixels.is_empty() || width == 0 {
         return (0, 0);
@@ -4151,6 +4455,60 @@ fn filter_mask_by_temporal_support(
         }
     }
     (output, kept)
+}
+
+
+fn build_shape_group_series(tracks: &[ShapeTrack], width: usize) -> Vec<ShapeGroupSeries> {
+    let mut grouped: BTreeMap<u64, Vec<&ShapeTrack>> = BTreeMap::new();
+    for track in tracks.iter().filter(|track| track.enabled) {
+        grouped.entry(track.group_id).or_default().push(track);
+    }
+
+    let mut result = Vec::with_capacity(grouped.len());
+    for (group_id, members) in grouped {
+        let mut frame_pixels: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
+        let mut anchor_frame = usize::MAX;
+        for track in &members {
+            anchor_frame = anchor_frame.min(track.anchor_frame);
+            for (&frame, pixels) in &track.matched_pixels {
+                frame_pixels
+                    .entry(frame)
+                    .or_default()
+                    .extend(pixels.iter().copied());
+            }
+        }
+        let anchor_frame = if anchor_frame == usize::MAX { 0 } else { anchor_frame };
+        let mut areas = BTreeMap::new();
+        let mut centroids = BTreeMap::new();
+        for (frame, pixels) in frame_pixels {
+            areas.insert(frame, pixels.len());
+            if width > 0 && !pixels.is_empty() {
+                let mut sum_x = 0u64;
+                let mut sum_y = 0u64;
+                for pixel in &pixels {
+                    let index = *pixel as usize;
+                    sum_x += (index % width) as u64;
+                    sum_y += (index / width) as u64;
+                }
+                let count = pixels.len() as u64;
+                centroids.insert(frame, ((sum_x / count) as u32, (sum_y / count) as u32));
+            }
+        }
+        let name = if members.len() == 1 {
+            members[0].name.clone()
+        } else {
+            format!("merged-{}", group_id)
+        };
+        result.push(ShapeGroupSeries {
+            id: group_id,
+            name,
+            member_count: members.len(),
+            anchor_frame,
+            areas,
+            centroids,
+        });
+    }
+    result
 }
 
 fn track_color(id: u64) -> egui::Color32 {
