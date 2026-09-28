@@ -1,11 +1,14 @@
 # Changes
 
-1. Replaces the old two-column `ScrollArea` preview with two floating image windows.
-2. Adds persistent `ImageViewState` for original and processed textures.
-3. Adds Fit, 1:1, Center, logarithmic zoom, +/− zoom, pan, linked views.
-4. Uses egui `InputState::zoom_delta()` for pinch/Ctrl-wheel zoom.
-5. Uses egui `InputState::translation_delta()` for touchpad pan.
-6. Keeps the existing `detect_green_shape` and image-processing pipeline untouched.
-7. Reduces UI polling during processing from 33 ms to 125 ms.
-8. Wakes egui immediately when processing completes or fails.
-9. Stops scheduling processing repaint timers after completion.
+## 0.5.0
+
+- Added separate **Save original** and **Save processed** actions.
+- Added continuous camera capture with a user-configurable interval in seconds.
+- Added capture-session directories with independent original/processed saving.
+- Added persistent image/source history and persistent image-sequence history fields.
+- Added image-sequence folder loading, including capture-session roots.
+- Added editor-style sequence timeline/scrubbing with frame number, absolute timestamp, and relative video time.
+- Added directory drag-and-drop as sequence loading.
+- Added original-image pixel inspection on hover (x/y, RGBA, hex).
+- Added capture-state handling so a slow camera/processor does not enqueue overlapping capture requests.
+- Updated package version to 0.5.0.

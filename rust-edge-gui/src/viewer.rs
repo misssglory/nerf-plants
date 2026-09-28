@@ -1,4 +1,5 @@
 use eframe::egui;
+use image::RgbaImage;
 
 pub const MIN_ZOOM: f32 = 0.02;
 pub const MAX_ZOOM: f32 = 32.0;
@@ -56,6 +57,7 @@ pub fn show_floating_image_window(
     ctx: &egui::Context,
     title: &str,
     texture: Option<&egui::TextureHandle>,
+    pixel_source: Option<&RgbaImage>,
     state: &mut ImageViewState,
     default_pos: egui::Pos2,
 ) -> ViewInteraction {
@@ -73,7 +75,7 @@ pub fn show_floating_image_window(
         .min_size(egui::vec2(300.0, 240.0))
         .resizable(true)
         .show(ctx, |ui| {
-            interaction = show_image_window_contents(ui, texture, state);
+            interaction = show_image_window_contents(ui, texture, pixel_source, state);
         });
 
     state.open = open;
@@ -83,6 +85,7 @@ pub fn show_floating_image_window(
 fn show_image_window_contents(
     ui: &mut egui::Ui,
     texture: Option<&egui::TextureHandle>,
+    pixel_source: Option<&RgbaImage>,
     state: &mut ImageViewState,
 ) -> ViewInteraction {
     let mut interaction = ViewInteraction::default();
@@ -207,6 +210,42 @@ fn show_image_window_contents(
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
+
+    if let (Some(source), Some(pointer)) = (pixel_source, response.hover_pos()) {
+        if image_rect.contains(pointer) && source.width() > 0 && source.height() > 0 {
+            let u = ((pointer.x - image_rect.min.x) / image_rect.width()).clamp(0.0, 0.999_999);
+            let v = ((pointer.y - image_rect.min.y) / image_rect.height()).clamp(0.0, 0.999_999);
+            let x = (u * source.width() as f32).floor() as u32;
+            let y = (v * source.height() as f32).floor() as u32;
+            let pixel = source.get_pixel(x, y).0;
+            let text = format!(
+                "x:{x} y:{y}  RGBA {}, {}, {}, {}  #{:02X}{:02X}{:02X}{:02X}",
+                pixel[0], pixel[1], pixel[2], pixel[3], pixel[0], pixel[1], pixel[2], pixel[3]
+            );
+
+            let mut label_pos = pointer + egui::vec2(12.0, 12.0);
+            let label_size = egui::vec2(330.0, 24.0);
+            if label_pos.x + label_size.x > viewport.right() {
+                label_pos.x = pointer.x - label_size.x - 12.0;
+            }
+            if label_pos.y + label_size.y > viewport.bottom() {
+                label_pos.y = pointer.y - label_size.y - 12.0;
+            }
+            let label_rect = egui::Rect::from_min_size(label_pos, label_size);
+            painter.rect_filled(
+                label_rect,
+                3.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+            );
+            painter.text(
+                label_rect.min + egui::vec2(6.0, 5.0),
+                egui::Align2::LEFT_TOP,
+                text,
+                egui::FontId::monospace(12.0),
+                egui::Color32::WHITE,
+            );
+        }
+    }
 
     interaction
 }

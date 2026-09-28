@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as _, Result};
+use chrono::{DateTime, Local};
 use eframe::egui;
 use image::{DynamicImage, GrayImage, Rgba, RgbaImage};
 use rayon::prelude::*;
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 const APP_TITLE: &str = "Rust Edge GUI — Green Shape + Edge Composer";
 const MAX_HISTORY: usize = 20;
+const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 
 fn main() -> eframe::Result {
     let initial_source = std::env::args().nth(1);
@@ -134,7 +136,9 @@ impl ProcessingWorker {
 #[derive(Clone)]
 enum SourceRequest {
     File(PathBuf),
+    SequenceFrame(PathBuf),
     Url(String),
+    CaptureUrl(String),
 }
 
 struct LoadedImage {
@@ -144,7 +148,12 @@ struct LoadedImage {
 }
 
 enum SourceMessage {
-    Loaded { id: u64, image: LoadedImage },
+    Loaded {
+        id: u64,
+        image: LoadedImage,
+        remember_source: bool,
+        preserve_view: bool,
+    },
     Failed { id: u64, error: String },
 }
 
@@ -180,6 +189,38 @@ impl SourceWorker {
 struct PersistedState {
     #[serde(default)]
     source_history: Vec<String>,
+    #[serde(default)]
+    sequence_history: Vec<String>,
+    #[serde(default)]
+    capture_base_dir: String,
+    #[serde(default)]
+    capture_interval_secs: f32,
+}
+
+#[derive(Clone)]
+struct SequenceFrame {
+    path: PathBuf,
+    timestamp: SystemTime,
+}
+
+struct ImageSequence {
+    root: PathBuf,
+    frames: Vec<SequenceFrame>,
+    selected: usize,
+}
+
+struct CaptureSession {
+    root: PathBuf,
+    original_dir: PathBuf,
+    processed_dir: PathBuf,
+    next_frame_index: u64,
+}
+
+struct PendingCapture {
+    source_id: u64,
+    processing_job_id: Option<u64>,
+    file_name: String,
+    captured_at: SystemTime,
 }
 
 struct GreenViewerApp {
@@ -192,6 +233,10 @@ struct GreenViewerApp {
     source_label: String,
     url_input: String,
     source_history: Vec<String>,
+    image_history_input: String,
+    sequence_history: Vec<String>,
+    sequence_history_input: String,
+    active_sequence: Option<ImageSequence>,
     source_worker: SourceWorker,
     next_source_id: u64,
     active_source_id: u64,
@@ -217,12 +262,34 @@ struct GreenViewerApp {
     original_view: viewer::ImageViewState,
     processed_view: viewer::ImageViewState,
     link_views: bool,
+
+    continuous_capture: bool,
+    capture_interval_secs: f32,
+    capture_base_dir_input: String,
+    capture_save_original: bool,
+    capture_save_processed: bool,
+    capture_url: Option<String>,
+    capture_session: Option<CaptureSession>,
+    pending_capture: Option<PendingCapture>,
+    next_capture_due: Option<Instant>,
 }
 
 impl GreenViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_source: Option<String>) -> Self {
         configure_dark_ui(&cc.egui_ctx);
         let persisted = load_persisted_state();
+        let image_history_input = persisted.source_history.first().cloned().unwrap_or_default();
+        let sequence_history_input = persisted.sequence_history.first().cloned().unwrap_or_default();
+        let capture_base_dir_input = if persisted.capture_base_dir.trim().is_empty() {
+            default_capture_base_dir().display().to_string()
+        } else {
+            persisted.capture_base_dir.clone()
+        };
+        let capture_interval_secs = if persisted.capture_interval_secs >= MIN_CAPTURE_INTERVAL_SECONDS {
+            persisted.capture_interval_secs
+        } else {
+            2.0
+        };
 
         let mut app = Self {
             original_rgba: None,
@@ -233,6 +300,10 @@ impl GreenViewerApp {
             source_label: "No image".to_owned(),
             url_input: String::new(),
             source_history: persisted.source_history,
+            image_history_input,
+            sequence_history: persisted.sequence_history,
+            sequence_history_input,
+            active_sequence: None,
             source_worker: SourceWorker::spawn(cc.egui_ctx.clone()),
             next_source_id: 0,
             active_source_id: 0,
@@ -254,6 +325,15 @@ impl GreenViewerApp {
             original_view: viewer::ImageViewState::default(),
             processed_view: viewer::ImageViewState::default(),
             link_views: false,
+            continuous_capture: false,
+            capture_interval_secs,
+            capture_base_dir_input,
+            capture_save_original: true,
+            capture_save_processed: true,
+            capture_url: None,
+            capture_session: None,
+            pending_capture: None,
+            next_capture_due: None,
         };
 
         if let Some(source) = initial_source {
@@ -277,6 +357,17 @@ impl GreenViewerApp {
     }
 
     fn queue_source(&mut self, request: SourceRequest) {
+        let is_capture = matches!(&request, SourceRequest::CaptureUrl(_));
+        if matches!(
+            &request,
+            SourceRequest::File(_) | SourceRequest::Url(_) | SourceRequest::CaptureUrl(_)
+        ) {
+            self.active_sequence = None;
+        }
+        if !is_capture {
+            self.pending_capture = None;
+        }
+
         self.next_source_id = self.next_source_id.wrapping_add(1).max(1);
         self.active_source_id = self.next_source_id;
         self.source_worker
@@ -299,12 +390,41 @@ impl GreenViewerApp {
     fn poll_source_worker(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.source_worker.rx.try_recv() {
             match message {
-                SourceMessage::Loaded { id, image } if id == self.active_source_id => {
+                SourceMessage::Loaded {
+                    id,
+                    image,
+                    remember_source,
+                    preserve_view,
+                } if id == self.active_source_id => {
                     self.source_loading = false;
-                    self.install_loaded_image(image, ctx);
+                    let is_pending_capture = self
+                        .pending_capture
+                        .as_ref()
+                        .is_some_and(|pending| pending.source_id == id);
+                    if is_pending_capture && self.continuous_capture {
+                        self.capture_url = Some(image.label.clone());
+                    }
+                    self.install_loaded_image(image, remember_source, preserve_view, ctx);
+                    if is_pending_capture {
+                        self.save_pending_capture_original();
+                        if self.processing {
+                            if let Some(pending) = self.pending_capture.as_mut() {
+                                pending.processing_job_id = Some(self.active_job_id);
+                            }
+                        } else {
+                            self.pending_capture = None;
+                        }
+                    }
                 }
                 SourceMessage::Failed { id, error } if id == self.active_source_id => {
                     self.source_loading = false;
+                    if self
+                        .pending_capture
+                        .as_ref()
+                        .is_some_and(|pending| pending.source_id == id)
+                    {
+                        self.pending_capture = None;
+                    }
                     self.error = Some(error);
                     self.status = "Load failed".to_owned();
                 }
@@ -313,7 +433,13 @@ impl GreenViewerApp {
         }
     }
 
-    fn install_loaded_image(&mut self, image: LoadedImage, ctx: &egui::Context) {
+    fn install_loaded_image(
+        &mut self,
+        image: LoadedImage,
+        remember_source: bool,
+        preserve_view: bool,
+        ctx: &egui::Context,
+    ) {
         let rgba = Arc::new(image.rgba);
         let gray = Arc::new(image.gray);
         self.original_texture = Some(ctx.load_texture(
@@ -324,21 +450,275 @@ impl GreenViewerApp {
         self.original_rgba = Some(rgba);
         self.original_gray = Some(gray);
         self.source_label = image.label.clone();
-        self.original_view.reset_fit();
-        self.processed_view.reset_fit();
+        if !preserve_view {
+            self.original_view.reset_fit();
+            self.processed_view.reset_fit();
+        }
         self.status = format!("Loaded {}; processing…", image.label);
         self.error = None;
-        self.remember_source(image.label);
+        if remember_source {
+            self.remember_source(image.label);
+        }
         self.schedule_processing();
     }
 
     fn remember_source(&mut self, source: String) {
         self.source_history.retain(|entry| entry != &source);
-        self.source_history.insert(0, source);
+        self.source_history.insert(0, source.clone());
         self.source_history.truncate(MAX_HISTORY);
+        self.image_history_input = source;
+        self.save_preferences();
+    }
+
+    fn remember_sequence(&mut self, source: String) {
+        self.sequence_history.retain(|entry| entry != &source);
+        self.sequence_history.insert(0, source.clone());
+        self.sequence_history.truncate(MAX_HISTORY);
+        self.sequence_history_input = source;
+        self.save_preferences();
+    }
+
+    fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
             source_history: self.source_history.clone(),
+            sequence_history: self.sequence_history.clone(),
+            capture_base_dir: self.capture_base_dir_input.clone(),
+            capture_interval_secs: self.capture_interval_secs,
         });
+    }
+
+    fn open_image_from_history_field(&mut self) {
+        let source = self.image_history_input.trim().to_owned();
+        if source.is_empty() {
+            return;
+        }
+
+        if source.starts_with("http://") || source.starts_with("https://") {
+            self.url_input = source.clone();
+            self.queue_source(SourceRequest::Url(source));
+            return;
+        }
+
+        let path = PathBuf::from(&source);
+        if path.is_file() {
+            self.queue_source(SourceRequest::File(path));
+        } else if let Ok(url) = normalize_camera_address(&source) {
+            self.url_input = source;
+            self.queue_source(SourceRequest::Url(url));
+        } else {
+            self.error = Some(format!("Image path does not exist: {}", path.display()));
+        }
+    }
+
+    fn open_sequence_from_history_field(&mut self) {
+        let value = self.sequence_history_input.trim().to_owned();
+        if value.is_empty() {
+            return;
+        }
+        self.open_sequence(PathBuf::from(value));
+    }
+
+    fn open_sequence(&mut self, root: PathBuf) {
+        match load_image_sequence(&root) {
+            Ok(sequence) => {
+                let selected_path = sequence.frames[sequence.selected].path.clone();
+                let root_label = sequence.root.display().to_string();
+                self.active_sequence = Some(sequence);
+                self.remember_sequence(root_label.clone());
+                self.status = format!("Opened image sequence {root_label}");
+                self.error = None;
+                self.original_view.reset_fit();
+                self.processed_view.reset_fit();
+                self.queue_source(SourceRequest::SequenceFrame(selected_path));
+            }
+            Err(error) => {
+                self.error = Some(format!("Failed to open image sequence: {error:#}"));
+            }
+        }
+    }
+
+    fn start_continuous_capture(&mut self) {
+        if !self.capture_save_original && !self.capture_save_processed {
+            self.error = Some("Enable original and/or processed capture saving first.".to_owned());
+            return;
+        }
+
+        let address = self.url_input.trim().to_owned();
+        let url = match normalize_camera_address(&address) {
+            Ok(url) => url,
+            Err(error) => {
+                self.error = Some(format!("Invalid camera address: {error:#}"));
+                return;
+            }
+        };
+
+        self.capture_interval_secs = self
+            .capture_interval_secs
+            .max(MIN_CAPTURE_INTERVAL_SECONDS);
+        let base_dir = PathBuf::from(self.capture_base_dir_input.trim());
+        if base_dir.as_os_str().is_empty() {
+            self.error = Some("Choose a capture directory first.".to_owned());
+            return;
+        }
+
+        let stamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+        let root = base_dir.join(format!("capture_{stamp}"));
+        let original_dir = root.join("original");
+        let processed_dir = root.join("processed");
+
+        let create_result = (|| -> Result<()> {
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("cannot create {}", root.display()))?;
+            if self.capture_save_original {
+                std::fs::create_dir_all(&original_dir)
+                    .with_context(|| format!("cannot create {}", original_dir.display()))?;
+            }
+            if self.capture_save_processed {
+                std::fs::create_dir_all(&processed_dir)
+                    .with_context(|| format!("cannot create {}", processed_dir.display()))?;
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = create_result {
+            self.error = Some(format!("Failed to start capture: {error:#}"));
+            return;
+        }
+
+        self.capture_session = Some(CaptureSession {
+            root: root.clone(),
+            original_dir,
+            processed_dir,
+            next_frame_index: 1,
+        });
+        self.capture_url = Some(url);
+        self.pending_capture = None;
+        self.next_capture_due = Some(Instant::now());
+        self.continuous_capture = true;
+        self.original_view.reset_fit();
+        self.processed_view.reset_fit();
+        self.remember_sequence(root.display().to_string());
+        self.save_preferences();
+        self.status = format!(
+            "Continuous capture started: every {:.3}s → {}",
+            self.capture_interval_secs,
+            root.display()
+        );
+        self.error = None;
+    }
+
+    fn stop_continuous_capture(&mut self) {
+        self.continuous_capture = false;
+        self.next_capture_due = None;
+        let location = self
+            .capture_session
+            .as_ref()
+            .map(|session| session.root.display().to_string());
+        self.capture_url = None;
+        self.save_preferences();
+        self.status = match location {
+            Some(location) => format!("Continuous capture stopped. Saved in {location}"),
+            None => "Continuous capture stopped.".to_owned(),
+        };
+    }
+
+    fn tick_continuous_capture(&mut self, ctx: &egui::Context) {
+        if !self.continuous_capture {
+            return;
+        }
+
+        let now = Instant::now();
+        let due = self.next_capture_due.unwrap_or(now);
+        if now >= due
+            && self.pending_capture.is_none()
+            && !self.source_loading
+            && !self.processing
+        {
+            let Some(url) = self.capture_url.clone() else {
+                self.stop_continuous_capture();
+                return;
+            };
+            let Some(session) = self.capture_session.as_mut() else {
+                self.stop_continuous_capture();
+                return;
+            };
+
+            let captured_at = SystemTime::now();
+            let timestamp: DateTime<Local> = captured_at.into();
+            let file_name = format!(
+                "frame_{:06}_{}.png",
+                session.next_frame_index,
+                timestamp.format("%Y%m%d_%H%M%S_%3f")
+            );
+            session.next_frame_index = session.next_frame_index.saturating_add(1);
+
+            self.queue_source(SourceRequest::CaptureUrl(url));
+            self.pending_capture = Some(PendingCapture {
+                source_id: self.active_source_id,
+                processing_job_id: None,
+                file_name,
+                captured_at,
+            });
+            self.next_capture_due = Some(
+                now + Duration::from_secs_f32(
+                    self.capture_interval_secs.max(MIN_CAPTURE_INTERVAL_SECONDS),
+                ),
+            );
+        }
+
+        let delay = match self.next_capture_due {
+            Some(next) if next > now => next.duration_since(now),
+            _ => Duration::from_millis(100),
+        };
+        ctx.request_repaint_after(delay.min(Duration::from_secs(1)));
+    }
+
+    fn save_pending_capture_original(&mut self) {
+        if !self.capture_save_original {
+            return;
+        }
+        let (Some(session), Some(pending), Some(image)) = (
+            self.capture_session.as_ref(),
+            self.pending_capture.as_ref(),
+            self.original_rgba.as_ref(),
+        ) else {
+            return;
+        };
+        let path = session.original_dir.join(&pending.file_name);
+        if let Err(error) = DynamicImage::ImageRgba8((**image).clone()).save(&path) {
+            self.error = Some(format!("Failed to save capture {}: {error}", path.display()));
+        }
+    }
+
+    fn save_pending_capture_processed(&mut self, completed_job_id: u64) {
+        let should_finish = self
+            .pending_capture
+            .as_ref()
+            .and_then(|pending| pending.processing_job_id)
+            .is_some_and(|id| id == completed_job_id);
+        if !should_finish {
+            return;
+        }
+
+        if self.capture_save_processed {
+            if let (Some(session), Some(pending), Some(image)) = (
+                self.capture_session.as_ref(),
+                self.pending_capture.as_ref(),
+                self.processed_rgba.as_ref(),
+            ) {
+                let path = session.processed_dir.join(&pending.file_name);
+                if let Err(error) = DynamicImage::ImageRgba8(image.clone()).save(&path) {
+                    self.error = Some(format!(
+                        "Failed to save processed capture {}: {error}",
+                        path.display()
+                    ));
+                } else {
+                    let absolute = format_absolute_time(pending.captured_at);
+                    self.status = format!("Captured {} ({absolute})", path.display());
+                }
+            }
+        }
+        self.pending_capture = None;
     }
 
     fn schedule_processing(&mut self) {
@@ -367,6 +747,11 @@ impl GreenViewerApp {
                 self.progress_stage = "Queued".to_owned();
                 self.dirty = false;
                 self.error = None;
+                if let Some(pending) = self.pending_capture.as_mut() {
+                    if pending.processing_job_id.is_some() {
+                        pending.processing_job_id = Some(self.active_job_id);
+                    }
+                }
             }
             Err(error) => {
                 self.processing = false;
@@ -409,10 +794,19 @@ impl GreenViewerApp {
                         self.shape_count, self.green_pixels, self.boundary_pixels
                     );
                     self.error = None;
+                    self.save_pending_capture_processed(id);
                 }
                 ProcessingMessage::Failed { id, error } if id == self.active_job_id => {
                     self.processing = false;
                     self.progress_stage = "Failed".to_owned();
+                    if self
+                        .pending_capture
+                        .as_ref()
+                        .and_then(|pending| pending.processing_job_id)
+                        .is_some_and(|job_id| job_id == id)
+                    {
+                        self.pending_capture = None;
+                    }
                     self.error = Some(error);
                 }
                 _ => {}
@@ -430,7 +824,13 @@ impl GreenViewerApp {
                 .collect::<Vec<_>>()
         });
         if let Some(path) = dropped.first() {
-            self.queue_source(SourceRequest::File(path.clone()));
+            if path.is_dir() {
+                self.sequence_history_input = path.display().to_string();
+                self.open_sequence(path.clone());
+            } else {
+                self.image_history_input = path.display().to_string();
+                self.queue_source(SourceRequest::File(path.clone()));
+            }
         }
     }
 
@@ -466,8 +866,8 @@ impl GreenViewerApp {
         );
 
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui.button("Open image from disk…").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Open image…").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Open image")
                     .add_filter(
@@ -476,8 +876,16 @@ impl GreenViewerApp {
                     )
                     .pick_file()
                 {
+                    self.image_history_input = path.display().to_string();
                     self.queue_source(SourceRequest::File(path));
                 }
+            }
+
+            if ui
+                .add_enabled(self.original_rgba.is_some(), egui::Button::new("Save original…"))
+                .clicked()
+            {
+                self.save_original();
             }
 
             if ui
@@ -488,28 +896,112 @@ impl GreenViewerApp {
             }
         });
 
+        ui.separator();
+        ui.heading("History / sequences");
+        ui.label("Image or URL");
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.image_history_input)
+                    .hint_text("/path/to/image.png or URL"),
+            );
+            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("Open").clicked() || enter {
+                self.open_image_from_history_field();
+            }
+        });
         if !self.source_history.is_empty() {
-            ui.collapsing("Input history", |ui| {
+            ui.collapsing("Recent images / sources", |ui| {
                 let history = self.source_history.clone();
                 for source in history {
                     if ui.selectable_label(false, &source).clicked() {
-                        if source.starts_with("http://") || source.starts_with("https://") {
-                            self.url_input = source.clone();
-                            self.queue_source(SourceRequest::Url(source));
-                        } else {
-                            let path = PathBuf::from(&source);
-                            if path.exists() {
-                                self.queue_source(SourceRequest::File(path));
-                            } else if let Ok(url) = normalize_camera_address(&source) {
-                                self.url_input = source.clone();
-                                self.queue_source(SourceRequest::Url(url));
-                            } else {
-                                self.queue_source(SourceRequest::File(path));
-                            }
-                        }
+                        self.image_history_input = source.clone();
+                        self.open_image_from_history_field();
                     }
                 }
             });
+        }
+
+        ui.add_space(4.0);
+        ui.label("Image sequence folder");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sequence_history_input)
+                    .hint_text("/path/to/sequence or capture session"),
+            );
+            if ui.button("Open sequence").clicked() {
+                self.open_sequence_from_history_field();
+            }
+            if ui.small_button("…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Open image sequence folder")
+                    .pick_folder()
+                {
+                    self.sequence_history_input = path.display().to_string();
+                    self.open_sequence(path);
+                }
+            }
+        });
+        if !self.sequence_history.is_empty() {
+            ui.collapsing("Recent image sequences", |ui| {
+                let history = self.sequence_history.clone();
+                for source in history {
+                    if ui.selectable_label(false, &source).clicked() {
+                        self.sequence_history_input = source;
+                        self.open_sequence_from_history_field();
+                    }
+                }
+            });
+        }
+
+        ui.separator();
+        ui.heading("Continuous capture");
+        ui.horizontal(|ui| {
+            ui.label("Every");
+            ui.add(
+                egui::DragValue::new(&mut self.capture_interval_secs)
+                    .range(MIN_CAPTURE_INTERVAL_SECONDS..=3600.0)
+                    .speed(0.1)
+                    .suffix(" s"),
+            );
+        });
+        ui.label("Save directory");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.capture_base_dir_input)
+                    .hint_text("capture directory"),
+            );
+            if ui.small_button("…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Choose capture directory")
+                    .pick_folder()
+                {
+                    self.capture_base_dir_input = path.display().to_string();
+                    self.save_preferences();
+                }
+            }
+        });
+        ui.add_enabled_ui(!self.continuous_capture, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.capture_save_original, "Original");
+                ui.checkbox(&mut self.capture_save_processed, "Processed");
+            });
+        });
+        ui.horizontal(|ui| {
+            if !self.continuous_capture {
+                if ui.button("Start continuous capture").clicked() {
+                    self.start_continuous_capture();
+                    ui.ctx().request_repaint();
+                }
+            } else if ui.button("Stop capture").clicked() {
+                self.stop_continuous_capture();
+            }
+            if self.continuous_capture {
+                ui.spinner();
+                ui.label("recording");
+            }
+        });
+        if let Some(session) = self.capture_session.as_ref() {
+            ui.small(format!("Session: {}", session.root.display()));
         }
 
         ui.separator();
@@ -632,7 +1124,53 @@ impl GreenViewerApp {
         ui.label(format!("Green shapes: {}", self.shape_count));
         ui.label(format!("Green pixels: {}", self.green_pixels));
         ui.label(format!("Boundary pixels: {}", self.boundary_pixels));
-        ui.small("CPU stays idle after work: both worker threads block on recv(), and the UI uses worker-triggered repaint instead of a repaint timer.");
+        ui.small("Workers block on recv() while idle. A repaint timer is only scheduled while continuous capture is active.");
+    }
+
+    fn sequence_timeline(&mut self, ui: &mut egui::Ui) {
+        let mut selected_path = None;
+
+        if let Some(sequence) = self.active_sequence.as_mut() {
+            let frame_count = sequence.frames.len();
+            if frame_count > 0 {
+                let previous = sequence.selected;
+                let frame = &sequence.frames[sequence.selected];
+                let absolute = format_absolute_time(frame.timestamp);
+                let relative = frame
+                    .timestamp
+                    .duration_since(sequence.frames[0].timestamp)
+                    .unwrap_or_default();
+
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Sequence");
+                        ui.monospace(format!(
+                            "{}/{}",
+                            sequence.selected.saturating_add(1),
+                            frame_count
+                        ));
+                        ui.separator();
+                        ui.monospace(format!("ABS {absolute}"));
+                        ui.separator();
+                        ui.monospace(format!("VIDEO {}", format_video_time(relative)));
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut sequence.selected, 0..=frame_count - 1)
+                            .show_value(false)
+                            .text("time"),
+                    );
+                    ui.small(format!("{}", sequence.root.display()));
+                });
+
+                if sequence.selected != previous {
+                    selected_path = Some(sequence.frames[sequence.selected].path.clone());
+                }
+            }
+        }
+
+        if let Some(path) = selected_path {
+            self.queue_source(SourceRequest::SequenceFrame(path));
+        }
     }
 
     fn previews(&mut self, ui: &mut egui::Ui) {
@@ -650,6 +1188,7 @@ impl GreenViewerApp {
             &ctx,
             "Original image",
             self.original_texture.as_ref(),
+            self.original_rgba.as_deref(),
             &mut self.original_view,
             egui::pos2(390.0, 80.0),
         );
@@ -661,6 +1200,7 @@ impl GreenViewerApp {
             &ctx,
             "Processed — green shapes",
             self.processed_texture.as_ref(),
+            None,
             &mut self.processed_view,
             egui::pos2(840.0, 120.0),
         );
@@ -669,6 +1209,34 @@ impl GreenViewerApp {
             && !original_interaction.transform_changed
         {
             self.original_view.copy_transform_from(&self.processed_view);
+        }
+    }
+
+    fn save_original(&mut self) {
+        let Some(image) = self.original_rgba.as_ref() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save original image")
+            .set_file_name("original.png")
+            .add_filter("PNG", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let mut path = path;
+        if path.extension().is_none() {
+            path.set_extension("png");
+        }
+        match DynamicImage::ImageRgba8((**image).clone()).save(&path) {
+            Ok(()) => {
+                self.status = format!("Saved {}", path.display());
+                self.error = None;
+            }
+            Err(error) => {
+                self.error = Some(format!("Failed to save {}: {error}", path.display()));
+            }
         }
     }
 
@@ -707,6 +1275,7 @@ impl eframe::App for GreenViewerApp {
         self.handle_dropped_files(&ctx);
         self.poll_source_worker(&ctx);
         self.poll_processing_worker(&ctx);
+        self.tick_continuous_capture(&ctx);
 
         egui::Panel::bottom("status-bar").show(ui, |ui| {
             if self.source_loading {
@@ -730,6 +1299,12 @@ impl eframe::App for GreenViewerApp {
             }
         });
 
+        if self.active_sequence.is_some() {
+            egui::Panel::bottom("sequence-timeline")
+                .resizable(false)
+                .show(ui, |ui| self.sequence_timeline(ui));
+        }
+
         egui::Panel::left("controls")
             .resizable(true)
             .default_size(380.0)
@@ -750,7 +1325,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.4")
+        .user_agent("rust-edge-gui/0.5")
         .build()
         .expect("failed to build HTTP client");
 
@@ -764,9 +1339,16 @@ fn source_loop(
             continue;
         }
 
+        let remember_source = matches!(&request, SourceRequest::File(_) | SourceRequest::Url(_));
+        let preserve_view = matches!(
+            &request,
+            SourceRequest::SequenceFrame(_) | SourceRequest::CaptureUrl(_)
+        );
         let result = match request {
-            SourceRequest::File(path) => load_file_source(&path),
-            SourceRequest::Url(url) => load_url_source(&client, &url),
+            SourceRequest::File(path) | SourceRequest::SequenceFrame(path) => load_file_source(&path),
+            SourceRequest::Url(url) | SourceRequest::CaptureUrl(url) => {
+                load_url_source(&client, &url)
+            }
         };
 
         if latest_id.load(Ordering::Acquire) != id {
@@ -774,7 +1356,12 @@ fn source_loop(
         }
 
         let message = match result {
-            Ok(image) => SourceMessage::Loaded { id, image },
+            Ok(image) => SourceMessage::Loaded {
+                id,
+                image,
+                remember_source,
+                preserve_view,
+            },
             Err(error) => SourceMessage::Failed {
                 id,
                 error: format!("Failed to load image: {error:#}"),
@@ -1235,6 +1822,91 @@ fn rgba_to_color_image(image: &RgbaImage) -> egui::ColorImage {
         [image.width() as usize, image.height() as usize],
         image.as_raw(),
     )
+}
+
+fn default_capture_base_dir() -> PathBuf {
+    dirs::picture_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rust-edge-gui-captures")
+}
+
+fn is_supported_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn load_image_sequence(root: &Path) -> Result<ImageSequence> {
+    if !root.exists() {
+        return Err(anyhow!("{} does not exist", root.display()));
+    }
+    if !root.is_dir() {
+        return Err(anyhow!("{} is not a directory", root.display()));
+    }
+
+    let candidate_dirs = [root.join("original"), root.join("processed"), root.to_path_buf()];
+    let mut frames = Vec::new();
+    let mut scan_dir = root.to_path_buf();
+
+    for candidate in candidate_dirs {
+        if !candidate.is_dir() {
+            continue;
+        }
+        let candidate_frames = std::fs::read_dir(&candidate)
+            .with_context(|| format!("cannot read {}", candidate.display()))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file() && is_supported_image_path(path))
+            .map(|path| {
+                let timestamp = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                SequenceFrame { path, timestamp }
+            })
+            .collect::<Vec<_>>();
+        if !candidate_frames.is_empty() {
+            scan_dir = candidate;
+            frames = candidate_frames;
+            break;
+        }
+    }
+
+    frames.sort_by(|a, b| a.path.cmp(&b.path));
+    if frames.is_empty() {
+        return Err(anyhow!(
+            "no supported images found in {}",
+            scan_dir.display()
+        ));
+    }
+
+    Ok(ImageSequence {
+        root: root.to_path_buf(),
+        frames,
+        selected: 0,
+    })
+}
+
+fn format_absolute_time(time: SystemTime) -> String {
+    let date_time: DateTime<Local> = time.into();
+    date_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+fn format_video_time(duration: Duration) -> String {
+    let total_millis = duration.as_millis();
+    let millis = total_millis % 1000;
+    let total_seconds = total_millis / 1000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
 fn configure_dark_ui(ctx: &egui::Context) {
