@@ -20,7 +20,7 @@ use yolo::{
     YoloRuntimeSettings, YoloWorker,
 };
 
-const APP_TITLE: &str = "Rust Edge GUI v0.7.5 — Auto Shape Groups";
+const APP_TITLE: &str = "Rust Edge GUI v0.7.6 — Plot Navigation & Scaled Pivots";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -377,6 +377,10 @@ impl PersistedWindowRect {
     fn size(self) -> egui::Vec2 { egui::vec2(self.size[0], self.size[1]) }
 }
 
+fn default_plot_center() -> f64 { 0.5 }
+fn default_plot_center_f32() -> f32 { 0.5 }
+fn default_plot_zoom() -> f32 { 1.0 }
+
 #[derive(Default, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
@@ -446,6 +450,14 @@ struct PersistedState {
     shape_plot_open: bool,
     #[serde(default)]
     plot_click_seek_enabled: bool,
+    #[serde(default = "default_plot_center")]
+    plot_x_center: f64,
+    #[serde(default = "default_plot_zoom")]
+    plot_x_zoom: f32,
+    #[serde(default = "default_plot_center_f32")]
+    plot_y_center: f32,
+    #[serde(default = "default_plot_zoom")]
+    plot_y_zoom: f32,
     #[serde(default)]
     url_input: String,
     #[serde(default)]
@@ -621,6 +633,13 @@ struct GreenViewerApp {
     auto_seed_pivots_pending: bool,
     shape_plot_open: bool,
     plot_click_seek_enabled: bool,
+    /// Normalized center/zoom of the interactive plot viewport. X is capture time,
+    /// Y is grouped mask area. Keeping these normalized makes the view stable when
+    /// sequences are extended while recording.
+    plot_x_center: f64,
+    plot_x_zoom: f32,
+    plot_y_center: f32,
+    plot_y_zoom: f32,
     sequence_playing: bool,
     sequence_playback_fps: f32,
     sequence_loop: bool,
@@ -656,6 +675,7 @@ impl GreenViewerApp {
         let persisted = load_persisted_state();
         let persisted_v2 = persisted.version >= 2;
         let persisted_v3 = persisted.version >= 3;
+        let persisted_v4 = persisted.version >= 4;
         let image_history_input = if persisted_v2 && !persisted.image_history_input.is_empty() {
             persisted.image_history_input.clone()
         } else {
@@ -801,6 +821,10 @@ impl GreenViewerApp {
             auto_seed_pivots_pending: false,
             shape_plot_open: if persisted_v2 { persisted.shape_plot_open } else { false },
             plot_click_seek_enabled: if persisted_v3 { persisted.plot_click_seek_enabled } else { true },
+            plot_x_center: if persisted_v4 { persisted.plot_x_center.clamp(0.0, 1.0) } else { 0.5 },
+            plot_x_zoom: if persisted_v4 { persisted.plot_x_zoom.clamp(1.0, 10_000.0) } else { 1.0 },
+            plot_y_center: if persisted_v4 { persisted.plot_y_center.clamp(0.0, 1.0) } else { 0.5 },
+            plot_y_zoom: if persisted_v4 { persisted.plot_y_zoom.clamp(1.0, 10_000.0) } else { 1.0 },
             sequence_playing: false,
             sequence_playback_fps: if persisted_v2 { persisted.sequence_playback_fps.clamp(0.1, 120.0) } else { 5.0 },
             sequence_loop: if persisted_v2 { persisted.sequence_loop } else { true },
@@ -1041,7 +1065,7 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
-            version: 3,
+            version: 4,
             source_history: self.source_history.clone(),
             sequence_history: self.sequence_history.clone(),
             capture_base_dir: self.capture_base_dir_input.clone(),
@@ -1074,6 +1098,10 @@ impl GreenViewerApp {
             shape_plot_window: Some(PersistedWindowRect::new(self.shape_plot_window_pos, self.shape_plot_window_size)),
             shape_plot_open: self.shape_plot_open,
             plot_click_seek_enabled: self.plot_click_seek_enabled,
+            plot_x_center: self.plot_x_center,
+            plot_x_zoom: self.plot_x_zoom,
+            plot_y_center: self.plot_y_center,
+            plot_y_zoom: self.plot_y_zoom,
             url_input: self.url_input.clone(),
             image_history_input: self.image_history_input.clone(),
             sequence_history_input: self.sequence_history_input.clone(),
@@ -2280,22 +2308,58 @@ impl GreenViewerApp {
         build_shape_group_series(&self.shape_tracks, width)
             .into_iter()
             .map(|group| {
-                let pixel = current_frame
-                    .and_then(|frame| group.centroids.get(&frame).copied())
+                let frame_for_value = current_frame.unwrap_or(group.anchor_frame);
+                let pixel = group
+                    .centroids
+                    .get(&frame_for_value)
+                    .copied()
                     .or_else(|| group.centroids.get(&group.anchor_frame).copied())
                     .unwrap_or((0, 0));
+                let area = if let Some(frame) = current_frame {
+                    group.areas.get(&frame).copied().unwrap_or(0)
+                } else {
+                    group.areas.get(&group.anchor_frame).copied().unwrap_or(0)
+                };
                 let label = if group.member_count > 1 {
-                    format!("G{} ({} shapes)", group.id, group.member_count)
+                    format!("G{}", group.id)
                 } else if current_frame == Some(group.anchor_frame) {
-                    format!("T{} anchor", group.id)
+                    format!("T{}*", group.id)
                 } else {
                     format!("T{}", group.id)
                 };
+                let kind = if group.member_count > 1 {
+                    format!("merged group · {} shapes", group.member_count)
+                } else {
+                    "tracked shape".to_owned()
+                };
+                let mut hover_text = format!(
+                    "{} {}
+area: {} px
+frame: {}
+pivot: {}, {}",
+                    label,
+                    kind,
+                    area,
+                    frame_for_value.saturating_add(1),
+                    pixel.0,
+                    pixel.1,
+                );
+                if let Some(timestamp) = self
+                    .active_sequence
+                    .as_ref()
+                    .and_then(|sequence| sequence.frames.get(frame_for_value))
+                    .map(|frame| frame.timestamp)
+                {
+                    hover_text.push_str(&format!("
+time: {}", format_absolute_time(timestamp)));
+                }
                 viewer::OverlayPoint {
                     id: Some(group.id),
                     pixel,
                     color: track_color(group.id),
                     label,
+                    radius: pivot_radius_for_area(area),
+                    hover_text,
                 }
             })
             .collect()
@@ -3312,14 +3376,19 @@ impl GreenViewerApp {
         let click_seek_enabled = self.plot_click_seek_enabled;
         let fallback_size = self.shape_plot_window_size;
 
+        // Work on locals while the egui Window borrows UI state, then commit at
+        // the end. X/Y navigation is normalized to the whole sequence/data range.
+        let mut plot_x_center = self.plot_x_center.clamp(0.0, 1.0);
+        let mut plot_x_zoom = self.plot_x_zoom.clamp(1.0, 10_000.0);
+        let mut plot_y_center = self.plot_y_center.clamp(0.0, 1.0);
+        let mut plot_y_zoom = self.plot_y_zoom.clamp(1.0, 10_000.0);
+
         let response = egui::Window::new("Tracked mask size")
             .id(egui::Id::new("tracked-mask-size-window"))
             .open(&mut open)
             .default_pos(self.shape_plot_window_pos)
             .default_size(self.shape_plot_window_size)
             .current_pos(self.shape_plot_window_pos)
-            // Keep the hard floor intentionally tiny. Plot chrome adapts to the
-            // current body size instead of forcing the window back open.
             .min_size(egui::vec2(160.0, 58.0))
             .constrain(false)
             .resizable([true, true])
@@ -3332,21 +3401,28 @@ impl GreenViewerApp {
                     (fallback_size.y - 34.0).max(48.0)
                 };
 
-                if body_h > 135.0 {
-                    ui.small("X = absolute capture time · Y = grouped mask area. Shapes that ever collide are permanently grouped. Dashed line = current frame.");
+                if body_h > 150.0 {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("Trackpad: horizontal/vertical scroll = pan X/Y · Ctrl+horizontal/vertical = zoom X/Y");
+                        if ui.small_button("Reset plot view").clicked() {
+                            plot_x_center = 0.5;
+                            plot_x_zoom = 1.0;
+                            plot_y_center = 0.5;
+                            plot_y_zoom = 1.0;
+                        }
+                    });
                 }
-                if body_h > 95.0 {
+                if body_h > 112.0 {
                     egui::ScrollArea::horizontal()
                         .id_salt("shape-plot-legend")
                         .max_height(22.0)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.monospace("Groups:");
                                 for group in &groups {
                                     let last = group.areas.last_key_value();
                                     let suffix = last
                                         .map(|(_, area)| format!("{} px", area))
-                                        .unwrap_or_else(|| "no sample".to_owned());
+                                        .unwrap_or_else(|| "no samples".to_owned());
                                     let prefix = if group.member_count > 1 { "G" } else { "T" };
                                     ui.colored_label(
                                         track_color(group.id),
@@ -3386,12 +3462,6 @@ impl GreenViewerApp {
                     return;
                 }
 
-                let border = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
-                painter.line_segment([rect.left_top(), rect.right_top()], border);
-                painter.line_segment([rect.right_top(), rect.right_bottom()], border);
-                painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
-                painter.line_segment([rect.left_bottom(), rect.left_top()], border);
-
                 let max_area = groups
                     .iter()
                     .flat_map(|group| group.areas.values().copied())
@@ -3403,19 +3473,106 @@ impl GreenViewerApp {
                     (Some(start), Some(end)) => (*start, *end),
                     _ => (UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(1)),
                 };
-                let span = end_time
+                let full_span = end_time
                     .duration_since(start_time)
                     .unwrap_or(Duration::from_secs(1))
                     .max(Duration::from_millis(1));
 
+                // Raw wheel events preserve independent X/Y deltas even when Ctrl
+                // is held. That is important for two-axis trackpad navigation.
+                if plot_response.contains_pointer() {
+                    let mut pan_scroll = egui::Vec2::ZERO;
+                    let mut zoom_scroll = egui::Vec2::ZERO;
+                    ui.input(|input| {
+                        for event in &input.events {
+                            if let egui::Event::MouseWheel {
+                                unit,
+                                delta,
+                                modifiers,
+                                ..
+                            } = event
+                            {
+                                let scale = match unit {
+                                    egui::MouseWheelUnit::Point => 1.0,
+                                    egui::MouseWheelUnit::Line => 24.0,
+                                    egui::MouseWheelUnit::Page => 180.0,
+                                };
+                                if modifiers.ctrl {
+                                    zoom_scroll += *delta * scale;
+                                } else {
+                                    pan_scroll += *delta * scale;
+                                }
+                            }
+                        }
+                    });
+
+                    let pointer = plot_response.hover_pos().unwrap_or_else(|| rect.center());
+                    let anchor_x = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+                    // Y data grows upward, so the bottom of the plot is 0.0.
+                    let anchor_y = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
+
+                    if pan_scroll.x.abs() > f32::EPSILON {
+                        let visible = 1.0 / plot_x_zoom as f64;
+                        plot_x_center -= pan_scroll.x as f64 / rect.width() as f64 * visible;
+                    }
+                    if pan_scroll.y.abs() > f32::EPSILON {
+                        let visible = 1.0 / plot_y_zoom;
+                        plot_y_center += pan_scroll.y / rect.height() * visible;
+                    }
+
+                    if zoom_scroll.x.abs() > f32::EPSILON {
+                        let old_visible = 1.0 / plot_x_zoom as f64;
+                        let old_start = plot_x_center - old_visible * 0.5;
+                        let anchor_value = old_start + anchor_x * old_visible;
+                        let factor = (zoom_scroll.x as f64 * 0.0075).exp();
+                        plot_x_zoom = (plot_x_zoom as f64 * factor).clamp(1.0, 10_000.0) as f32;
+                        let new_visible = 1.0 / plot_x_zoom as f64;
+                        plot_x_center = anchor_value + (0.5 - anchor_x) * new_visible;
+                    }
+                    if zoom_scroll.y.abs() > f32::EPSILON {
+                        let old_visible = 1.0 / plot_y_zoom;
+                        let old_start = plot_y_center - old_visible * 0.5;
+                        let anchor_value = old_start + anchor_y * old_visible;
+                        let factor = (zoom_scroll.y * 0.0075).exp();
+                        plot_y_zoom = (plot_y_zoom * factor).clamp(1.0, 10_000.0);
+                        let new_visible = 1.0 / plot_y_zoom;
+                        plot_y_center = anchor_value + (0.5 - anchor_y) * new_visible;
+                    }
+
+                    let x_half = 0.5 / plot_x_zoom as f64;
+                    plot_x_center = plot_x_center.clamp(x_half, 1.0 - x_half);
+                    let y_half = 0.5 / plot_y_zoom;
+                    plot_y_center = plot_y_center.clamp(y_half, 1.0 - y_half);
+                }
+
+                let x_visible = 1.0 / plot_x_zoom as f64;
+                let x_min = (plot_x_center - x_visible * 0.5).clamp(0.0, 1.0 - x_visible);
+                let x_max = x_min + x_visible;
+                let visible_span = Duration::from_secs_f64(
+                    (full_span.as_secs_f64() * x_visible).max(0.001),
+                );
+
+                let y_visible = 1.0 / plot_y_zoom;
+                let y_min = (plot_y_center - y_visible * 0.5).clamp(0.0, 1.0 - y_visible);
+                let y_max = y_min + y_visible;
+
                 let x_for_frame = |frame: usize| -> Option<f32> {
                     let timestamp = *sequence_times.get(frame)?;
                     let offset = timestamp.duration_since(start_time).ok()?;
-                    Some(
-                        rect.left()
-                            + (offset.as_secs_f64() / span.as_secs_f64()) as f32 * rect.width(),
-                    )
+                    let norm = (offset.as_secs_f64() / full_span.as_secs_f64()).clamp(0.0, 1.0);
+                    Some(rect.left() + ((norm - x_min) / (x_max - x_min)) as f32 * rect.width())
                 };
+
+                let y_for_area = |area: usize| -> f32 {
+                    let norm = area as f32 / max_area as f32;
+                    rect.bottom() - ((norm - y_min) / (y_max - y_min)) * rect.height()
+                };
+
+                let border = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
+                painter.line_segment([rect.left_top(), rect.right_top()], border);
+                painter.line_segment([rect.right_top(), rect.right_bottom()], border);
+                painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
+                painter.line_segment([rect.left_bottom(), rect.left_top()], border);
 
                 let grid_steps = if rect.height() > 85.0 { 4 } else { 2 };
                 for step in 0..=grid_steps {
@@ -3426,10 +3583,11 @@ impl GreenViewerApp {
                         egui::Stroke::new(0.5, egui::Color32::from_gray(45)),
                     );
                     if rect.height() > 55.0 {
+                        let value_norm = y_min + (y_max - y_min) * t;
                         painter.text(
                             egui::pos2(rect.left() - 5.0, y),
                             egui::Align2::RIGHT_CENTER,
-                            format!("{}", (max_area as f32 * t).round() as usize),
+                            format!("{}", (max_area as f32 * value_norm).round() as usize),
                             egui::FontId::monospace(9.0),
                             egui::Color32::GRAY,
                         );
@@ -3439,7 +3597,9 @@ impl GreenViewerApp {
                 let time_steps = if rect.width() > 520.0 { 4 } else if rect.width() > 300.0 { 2 } else { 1 };
                 for step in 0..=time_steps {
                     let t = step as f64 / time_steps.max(1) as f64;
-                    let tick_time = start_time + Duration::from_secs_f64(span.as_secs_f64() * t);
+                    let full_fraction = x_min + (x_max - x_min) * t;
+                    let tick_time = start_time
+                        + Duration::from_secs_f64(full_span.as_secs_f64() * full_fraction);
                     let x = egui::lerp(rect.left()..=rect.right(), t as f32);
                     painter.line_segment(
                         [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -3449,32 +3609,48 @@ impl GreenViewerApp {
                         painter.text(
                             egui::pos2(x, rect.bottom() + 5.0),
                             egui::Align2::CENTER_TOP,
-                            format_plot_axis_time(tick_time, span),
+                            format_plot_axis_time(tick_time, visible_span),
                             egui::FontId::monospace(9.0),
                             egui::Color32::GRAY,
                         );
                     }
                 }
 
+                let data_painter = painter.with_clip_rect(rect);
+                let plot_hover = plot_response.hover_pos().filter(|pos| rect.contains(*pos));
+                let mut hovered_data_point: Option<(f32, u64, usize, usize, egui::Pos2)> = None;
                 for group in &groups {
                     let color = track_color(group.id);
                     let mut points = Vec::new();
                     for (&frame, &area) in &group.areas {
                         let Some(x) = x_for_frame(frame) else { continue; };
-                        let y = rect.bottom() - area as f32 / max_area as f32 * rect.height();
-                        points.push(egui::pos2(x, y));
+                        let y = y_for_area(area);
+                        let point = egui::pos2(x, y);
+                        points.push((frame, area, point));
+                        if rect.contains(point)
+                            && let Some(pointer) = plot_hover
+                        {
+                            let distance_sq = point.distance_sq(pointer);
+                            if distance_sq <= 9.0 * 9.0
+                                && hovered_data_point
+                                    .as_ref()
+                                    .is_none_or(|current| distance_sq < current.0)
+                            {
+                                hovered_data_point = Some((distance_sq, group.id, frame, area, point));
+                            }
+                        }
                     }
                     for pair in points.windows(2) {
-                        painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0, color));
+                        data_painter.line_segment([pair[0].2, pair[1].2], egui::Stroke::new(2.0, color));
                     }
-                    for point in points {
-                        painter.circle_filled(point, 2.8, color);
+                    for (_, _, point) in points {
+                        data_painter.circle_filled(point, 2.8, color);
                     }
                     if let Some(x) = x_for_frame(group.anchor_frame)
                         && let Some(area) = group.areas.get(&group.anchor_frame)
                     {
-                        let y = rect.bottom() - *area as f32 / max_area as f32 * rect.height();
-                        painter.circle_stroke(
+                        let y = y_for_area(*area);
+                        data_painter.circle_stroke(
                             egui::pos2(x, y),
                             5.5,
                             egui::Stroke::new(1.8, color),
@@ -3482,8 +3658,41 @@ impl GreenViewerApp {
                     }
                 }
 
+                if let Some((_, group_id, frame, area, point)) = hovered_data_point {
+                    data_painter.circle_filled(point, 4.5, egui::Color32::YELLOW);
+                    data_painter.circle_stroke(point, 7.0, egui::Stroke::new(1.2, egui::Color32::YELLOW));
+                    let time_text = sequence_times
+                        .get(frame)
+                        .map(|time| format_absolute_time(*time))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let text = format!("G/T {}\nframe: {}\narea: {} px\ntime: {}", group_id, frame + 1, area, time_text);
+                    let tooltip_size = egui::vec2(210.0, 70.0);
+                    let mut tooltip_pos = point + egui::vec2(10.0, 10.0);
+                    if tooltip_pos.x + tooltip_size.x > plot_response.rect.right() {
+                        tooltip_pos.x = point.x - tooltip_size.x - 10.0;
+                    }
+                    if tooltip_pos.y + tooltip_size.y > plot_response.rect.bottom() {
+                        tooltip_pos.y = point.y - tooltip_size.y - 10.0;
+                    }
+                    let tooltip_rect = egui::Rect::from_min_size(tooltip_pos, tooltip_size);
+                    painter.rect_filled(
+                        tooltip_rect,
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 230),
+                    );
+                    painter.text(
+                        tooltip_rect.min + egui::vec2(7.0, 6.0),
+                        egui::Align2::LEFT_TOP,
+                        text,
+                        egui::FontId::monospace(10.5),
+                        egui::Color32::YELLOW,
+                    );
+                }
+
                 if let Some(frame_index) = selected_frame
                     && let Some(x) = x_for_frame(frame_index)
+                    && x >= rect.left()
+                    && x <= rect.right()
                 {
                     let stroke = egui::Stroke::new(1.4, egui::Color32::WHITE);
                     let mut y = rect.top();
@@ -3498,7 +3707,7 @@ impl GreenViewerApp {
                         painter.text(
                             egui::pos2(x, rect.top() - 4.0),
                             egui::Align2::CENTER_BOTTOM,
-                            format!("F{} {}", frame_index + 1, format_plot_axis_time(*timestamp, span)),
+                            format!("F{} {}", frame_index + 1, format_plot_axis_time(*timestamp, visible_span)),
                             egui::FontId::monospace(9.0),
                             egui::Color32::WHITE,
                         );
@@ -3520,8 +3729,9 @@ impl GreenViewerApp {
                         && let Some(pointer) = plot_response.interact_pointer_pos()
                         && axis_hit.contains(pointer)
                     {
-                        let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                        let target_offset = span.as_secs_f64() * fraction as f64;
+                        let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+                        let target_norm = x_min + fraction * (x_max - x_min);
+                        let target_offset = full_span.as_secs_f64() * target_norm;
                         seek_frame = sequence_times
                             .iter()
                             .enumerate()
@@ -3548,6 +3758,10 @@ impl GreenViewerApp {
             self.shape_plot_window_size = response.response.rect.size();
         }
         self.shape_plot_open = open;
+        self.plot_x_center = plot_x_center;
+        self.plot_x_zoom = plot_x_zoom;
+        self.plot_y_center = plot_y_center;
+        self.plot_y_zoom = plot_y_zoom;
 
         if let Some(frame) = seek_frame {
             self.seek_sequence_frame(frame);
@@ -3691,7 +3905,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.7.5")
+        .user_agent("rust-edge-gui/0.7.6")
         .build()
         .expect("failed to build HTTP client");
 
@@ -4457,6 +4671,16 @@ fn filter_mask_by_temporal_support(
     (output, kept)
 }
 
+
+fn pivot_radius_for_area(area: usize) -> f32 {
+    // Screen-space radius follows log10(area), so a 10× larger leaf is visibly
+    // larger without letting large masks dominate the image. Zero/missing areas
+    // keep the smallest marker.
+    if area == 0 {
+        return 4.5;
+    }
+    (4.5 + (area as f32 + 1.0).log10() * 2.25).clamp(4.5, 18.0)
+}
 
 fn build_shape_group_series(tracks: &[ShapeTrack], width: usize) -> Vec<ShapeGroupSeries> {
     let mut grouped: BTreeMap<u64, Vec<&ShapeTrack>> = BTreeMap::new();

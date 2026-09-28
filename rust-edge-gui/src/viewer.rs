@@ -52,6 +52,10 @@ pub struct OverlayPoint {
     pub pixel: (u32, u32),
     pub color: egui::Color32,
     pub label: String,
+    /// Screen-space marker radius. The processed view uses log(mask area).
+    pub radius: f32,
+    /// Values shown while the marker is hovered.
+    pub hover_text: String,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -249,7 +253,8 @@ fn show_image_window_contents(
                     image_rect.min.y + py / image_size.y * image_rect.height(),
                 );
                 let distance_sq = screen.distance_sq(pointer);
-                (distance_sq <= 14.0 * 14.0).then_some((id, distance_sq))
+                let hit_radius = (point.radius + 6.0).max(12.0);
+                (distance_sq <= hit_radius * hit_radius).then_some((id, distance_sq))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(id, _)| id)
@@ -268,14 +273,49 @@ fn show_image_window_contents(
             } else {
                 point.color
             };
-            painter.circle_filled(screen, 5.0, color);
-            painter.circle_stroke(screen, 8.0, egui::Stroke::new(1.5, color));
+            let radius = point.radius.clamp(3.0, 24.0);
+            painter.circle_filled(screen, radius, color);
+            painter.circle_stroke(screen, radius + 3.0, egui::Stroke::new(1.5, color));
             painter.text(
-                screen + egui::vec2(10.0, -10.0),
+                screen + egui::vec2(radius + 5.0, -(radius + 2.0)),
                 egui::Align2::LEFT_BOTTOM,
                 &point.label,
                 egui::FontId::monospace(11.0),
                 color,
+            );
+        }
+    }
+
+    if let (Some(pointer), Some(overlay_id)) = (response.hover_pos(), hovered_overlay_id) {
+        if let Some(point) = overlays.iter().find(|point| point.id == Some(overlay_id)) {
+            let lines = point.hover_text.lines().count().max(1) as f32;
+            let text_width = point
+                .hover_text
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(1) as f32
+                * 7.2;
+            let tooltip_size = egui::vec2(text_width.clamp(120.0, 330.0) + 14.0, lines * 15.0 + 12.0);
+            let mut tooltip_pos = pointer + egui::vec2(14.0, 14.0);
+            if tooltip_pos.x + tooltip_size.x > viewport.right() {
+                tooltip_pos.x = pointer.x - tooltip_size.x - 14.0;
+            }
+            if tooltip_pos.y + tooltip_size.y > viewport.bottom() {
+                tooltip_pos.y = pointer.y - tooltip_size.y - 14.0;
+            }
+            let tooltip_rect = egui::Rect::from_min_size(tooltip_pos, tooltip_size);
+            painter.rect_filled(
+                tooltip_rect,
+                3.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 230),
+            );
+            painter.text(
+                tooltip_rect.min + egui::vec2(7.0, 6.0),
+                egui::Align2::LEFT_TOP,
+                &point.hover_text,
+                egui::FontId::monospace(11.0),
+                egui::Color32::YELLOW,
             );
         }
     }
@@ -296,7 +336,7 @@ fn show_image_window_contents(
             }
 
             if let Some(source) = pixel_source {
-                if x < source.width() && y < source.height() {
+                if hovered_overlay_id.is_none() && x < source.width() && y < source.height() {
                     let pixel = source.get_pixel(x, y).0;
                     let text = format!(
                         "x:{x} y:{y}  RGBA {}, {}, {}, {}  #{:02X}{:02X}{:02X}{:02X}",

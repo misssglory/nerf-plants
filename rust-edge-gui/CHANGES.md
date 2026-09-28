@@ -1,5 +1,16 @@
 # Changes
 
+## 0.7.6
+
+- Add independent two-axis trackpad navigation to the tracked-size plot: horizontal scroll pans time, vertical scroll pans area.
+- Add independent Ctrl+scroll plot zoom: Ctrl+horizontal zooms X/time and Ctrl+vertical zooms Y/area, anchored under the pointer.
+- Persist plot pan/zoom state with the rest of the UI preferences (state schema v4) and add an in-window `Reset plot view` action.
+- Show plot data-point values on hover: track/group ID, frame, mask area and absolute timestamp.
+- Show Processed-image pivot values on hover: track/group identity, current mask area, frame, pivot coordinates and absolute timestamp; hovered pivots remain yellow.
+- Scale Processed-image pivot markers logarithmically from the current frame/group mask area, with bounded screen-space radii.
+- Suppress the pixel-inspector tooltip while hovering a pivot so the two value cards do not overlap.
+- Bump package version to 0.7.6.
+
 ## 0.7.5
 
 - Lower the tracked-size plot hard minimum and make help/legend responsive so the plot window can be resized much smaller vertically without content forcing it open again.

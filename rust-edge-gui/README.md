@@ -1,9 +1,18 @@
-# rust-edge-gui 0.7.5
+# rust-edge-gui 0.7.6
 
 Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, native offline YOLO segmentation, per-window navigation, sequence playback, temporal false-positive filtering, and tracked mask-area plots.
 
 
 
+
+## What changed in 0.7.6
+
+- **2D plot navigation** — two-finger horizontal scroll pans absolute time while vertical scroll pans mask area independently.
+- **2D plot zoom** — hold `Ctrl`: horizontal scroll zooms only the time/X axis and vertical scroll zooms only the area/Y axis. Zoom is anchored under the pointer.
+- **Persistent plot viewport** — plot pan/zoom is restored across relaunches; use `Reset plot view` in the plot window to return to the full range.
+- **Point hover values** — hovering a graph sample shows group/track ID, frame, area and absolute time.
+- **Pivot hover values** — hovering a Processed-image pivot shows identity, current area, frame, coordinates and time.
+- **Area-scaled pivots** — Processed marker radius follows a bounded `log10(mask area)` mapping, so large leaves/plants read larger without overwhelming the image.
 
 ## What changed in 0.7.5
 
