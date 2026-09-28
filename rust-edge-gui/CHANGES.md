@@ -1,5 +1,17 @@
 # Changes
 
+## 0.7.4
+
+- Fix tracked-size plot height feedback: plot canvas now follows the current visible window body instead of the previous persisted outer size, and the track legend no longer wraps vertically.
+- Hovered pivot/track markers are highlighted yellow.
+- Pressing `P` while hovering an existing pivot removes that track instead of stacking another pivot on it.
+- Add global `Space` play/pause hotkey for image sequences (suppressed while editing text).
+- Add click-to-seek on the plot X-axis; clicking chooses the nearest frame by absolute timestamp.
+- Add a persisted `Click plot X-axis to seek frame` interface toggle.
+- Persist the new plot interaction setting and bump state schema to v3.
+- Bump package version to 0.7.4.
+
+
 ## 0.7.3
 
 - Backfill new shape tracks immediately from all compatible cached sequence masks; playback is no longer required to populate already-cached historical points.

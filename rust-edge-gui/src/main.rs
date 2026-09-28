@@ -20,7 +20,7 @@ use yolo::{
     YoloRuntimeSettings, YoloWorker,
 };
 
-const APP_TITLE: &str = "Rust Edge GUI v0.7.3 — Anchored Shape Tracking";
+const APP_TITLE: &str = "Rust Edge GUI v0.7.4 — Interactive Shape Tracking";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -445,6 +445,8 @@ struct PersistedState {
     #[serde(default)]
     shape_plot_open: bool,
     #[serde(default)]
+    plot_click_seek_enabled: bool,
+    #[serde(default)]
     url_input: String,
     #[serde(default)]
     image_history_input: String,
@@ -601,6 +603,7 @@ struct GreenViewerApp {
     shape_tracks: Vec<ShapeTrack>,
     next_track_id: u64,
     shape_plot_open: bool,
+    plot_click_seek_enabled: bool,
     sequence_playing: bool,
     sequence_playback_fps: f32,
     sequence_loop: bool,
@@ -635,6 +638,7 @@ impl GreenViewerApp {
         configure_dark_ui(&cc.egui_ctx);
         let persisted = load_persisted_state();
         let persisted_v2 = persisted.version >= 2;
+        let persisted_v3 = persisted.version >= 3;
         let image_history_input = if persisted_v2 && !persisted.image_history_input.is_empty() {
             persisted.image_history_input.clone()
         } else {
@@ -778,6 +782,7 @@ impl GreenViewerApp {
             shape_tracks: Vec::new(),
             next_track_id: 0,
             shape_plot_open: if persisted_v2 { persisted.shape_plot_open } else { false },
+            plot_click_seek_enabled: if persisted_v3 { persisted.plot_click_seek_enabled } else { true },
             sequence_playing: false,
             sequence_playback_fps: if persisted_v2 { persisted.sequence_playback_fps.clamp(0.1, 120.0) } else { 5.0 },
             sequence_loop: if persisted_v2 { persisted.sequence_loop } else { true },
@@ -1018,7 +1023,7 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
-            version: 2,
+            version: 3,
             source_history: self.source_history.clone(),
             sequence_history: self.sequence_history.clone(),
             capture_base_dir: self.capture_base_dir_input.clone(),
@@ -1050,6 +1055,7 @@ impl GreenViewerApp {
             controls_window: Some(PersistedWindowRect::new(self.controls_window_pos, self.controls_window_size)),
             shape_plot_window: Some(PersistedWindowRect::new(self.shape_plot_window_pos, self.shape_plot_window_size)),
             shape_plot_open: self.shape_plot_open,
+            plot_click_seek_enabled: self.plot_click_seek_enabled,
             url_input: self.url_input.clone(),
             image_history_input: self.image_history_input.clone(),
             sequence_history_input: self.sequence_history_input.clone(),
@@ -2032,6 +2038,7 @@ impl GreenViewerApp {
                     .and_then(|frame| track.matched_centroids.get(&frame).copied())
                     .unwrap_or(track.anchor_pivot);
                 viewer::OverlayPoint {
+                    id: Some(track.id),
                     pixel,
                     color: track_color(track.id),
                     label: if current_frame == Some(track.anchor_frame) {
@@ -2074,6 +2081,34 @@ impl GreenViewerApp {
         }
         if let Some(path) = path {
             self.queue_source(SourceRequest::SequenceFrame(path));
+        }
+    }
+
+    fn seek_sequence_frame(&mut self, frame_index: usize) {
+        let path = {
+            let Some(sequence) = self.active_sequence.as_mut() else {
+                return;
+            };
+            if sequence.frames.is_empty() {
+                return;
+            }
+            let index = frame_index.min(sequence.frames.len().saturating_sub(1));
+            sequence.selected = index;
+            sequence.frames[index].path.clone()
+        };
+        self.sequence_playing = false;
+        self.next_sequence_frame_due = None;
+        self.queue_source(SourceRequest::SequenceFrame(path));
+    }
+
+    fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.active_sequence.is_none() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Space)) {
+            self.sequence_playing = !self.sequence_playing;
+            self.next_sequence_frame_due = Some(Instant::now());
+            ctx.request_repaint();
         }
     }
 
@@ -2742,6 +2777,7 @@ impl GreenViewerApp {
                 );
                 ui.checkbox(&mut self.sequence_loop, "Loop");
                 ui.checkbox(&mut self.sequence_wait_processing, "Wait for processing");
+                ui.monospace("Space = play/pause");
             });
 
             if let Some(sequence) = self.active_sequence.as_mut() {
@@ -2807,7 +2843,13 @@ impl GreenViewerApp {
                 }
                 self.save_preferences();
             }
-            ui.small("Hover a closed component in Processed and press P. The clicked pixel + frame become an immutable identity anchor; matching then propagates outward through neighbouring cached masks.");
+            ui.small("Hover a closed component in Processed and press P. The clicked pixel + frame become an immutable identity anchor; matching then propagates outward through neighbouring cached masks. Hover an existing pivot (yellow) and press P to remove it.");
+            if ui
+                .checkbox(&mut self.plot_click_seek_enabled, "Click plot X-axis to seek frame")
+                .changed()
+            {
+                self.save_preferences();
+            }
 
             ui.separator();
             let mut temporal_changed = false;
@@ -2940,7 +2982,15 @@ impl GreenViewerApp {
             &mut self.processed_view,
             egui::pos2(900.0, 100.0),
         );
-        if let Some(pixel) = processed_interaction.pivot_pixel {
+        if let Some(track_id) = processed_interaction.toggle_overlay_id {
+            if let Some(index) = self.shape_tracks.iter().position(|track| track.id == track_id) {
+                self.shape_tracks.remove(index);
+                self.status = format!("Removed tracked pivot T{track_id}.");
+                if self.shape_tracks.is_empty() {
+                    self.shape_plot_open = false;
+                }
+            }
+        } else if let Some(pixel) = processed_interaction.pivot_pixel {
             self.add_shape_track_at_pivot(pixel);
         }
 
@@ -2960,7 +3010,9 @@ impl GreenViewerApp {
         if !self.shape_plot_open || self.shape_tracks.is_empty() {
             return;
         }
+
         let mut open = self.shape_plot_open;
+        let mut seek_frame = None;
         let response = egui::Window::new("Tracked mask size")
             .id(egui::Id::new("tracked-mask-size-window"))
             .open(&mut open)
@@ -2971,25 +3023,54 @@ impl GreenViewerApp {
             .constrain(false)
             .resizable([true, true])
             .show(ctx, |ui| {
-                ui.small("X = absolute capture time · Y = mask area in pixels. Dashed vertical line = currently rendered frame.");
+                ui.small("X = absolute capture time · Y = mask area in pixels. Dashed line = current frame. Space = play/pause.");
 
-                // Size the canvas from the actual persisted/user-picked outer window
-                // rectangle, not from the Resize max-rect. Using the max-rect here makes
-                // a canvas self-request the maximum height, which in turn prevents the
-                // user from shrinking the plot window. During a drag this trails the
-                // resize by at most one frame, then follows the new size exactly.
-                let desired_plot_width = (self.shape_plot_window_size.x - 28.0).max(360.0);
-                let desired_plot_height = (self.shape_plot_window_size.y - 104.0).max(130.0);
-                let available_width = ui.available_width();
-                let plot_width = if available_width.is_finite() {
-                    desired_plot_width.min(available_width.max(360.0))
+                // Keep the legend on exactly one row. The previous wrapped legend
+                // changed the content height when a second pivot was added; because
+                // the canvas height was derived from the previous outer window size,
+                // that created a positive resize feedback loop.
+                ui.horizontal(|ui| {
+                    ui.monospace("Tracks:");
+                    for track in self.shape_tracks.iter().filter(|track| track.enabled) {
+                        let last = track.observations.last_key_value();
+                        let suffix = last
+                            .map(|(_, observation)| format!("{} px / {:.2}", observation.area, observation.overlap))
+                            .unwrap_or_else(|| "no sample".to_owned());
+                        ui.colored_label(
+                            track_color(track.id),
+                            format!("T{} {} [{}]", track.id, track.name, suffix),
+                        );
+                        ui.separator();
+                    }
+                });
+
+                // Use the ACTUAL visible body rectangle of the window in this frame,
+                // rather than the persisted outer size from the previous frame. This
+                // makes vertical resizing stable in both directions and prevents both
+                // the minimum-height collapse and unbounded growth feedback.
+                let visible = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+                let plot_width = if visible.width().is_finite() {
+                    visible.width().max(360.0)
                 } else {
-                    desired_plot_width
+                    620.0
                 };
-                let plot_size = egui::vec2(plot_width, desired_plot_height);
-                let (response, painter) =
-                    ui.allocate_painter(plot_size, egui::Sense::hover());
-                let rect = response.rect.shrink2(egui::vec2(58.0, 32.0));
+                let plot_height = if visible.height().is_finite() {
+                    visible.height().max(130.0)
+                } else {
+                    260.0
+                };
+                let sense = if self.plot_click_seek_enabled {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                };
+                let (plot_response, painter) =
+                    ui.allocate_painter(egui::vec2(plot_width, plot_height), sense);
+                let rect = plot_response.rect.shrink2(egui::vec2(58.0, 32.0));
+                if rect.width() <= 1.0 || rect.height() <= 1.0 {
+                    return;
+                }
+
                 let border = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
                 painter.line_segment([rect.left_top(), rect.right_top()], border);
                 painter.line_segment([rect.right_top(), rect.right_bottom()], border);
@@ -3127,34 +3208,58 @@ impl GreenViewerApp {
                     }
                 }
 
-                ui.horizontal_wrapped(|ui| {
-                    for track in self.shape_tracks.iter().filter(|track| track.enabled) {
-                        let last = track.observations.last_key_value();
-                        let suffix = last
-                            .map(|(_, observation)| {
-                                format!("{} px · overlap {:.2}", observation.area, observation.overlap)
-                            })
-                            .unwrap_or_else(|| "no sample".to_owned());
-                        ui.colored_label(
-                            track_color(track.id),
-                            format!(
-                                "T{} {}: {} · anchor F{} @ {},{}",
-                                track.id,
-                                track.name,
-                                suffix,
-                                track.anchor_frame.saturating_add(1),
-                                track.anchor_pivot.0,
-                                track.anchor_pivot.1
-                            ),
-                        );
+                if self.plot_click_seek_enabled {
+                    // Treat the lower strip around the X-axis as the seek target.
+                    let axis_hit = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), rect.bottom() - 10.0),
+                        egui::pos2(rect.right(), plot_response.rect.bottom()),
+                    );
+                    if let Some(pointer) = plot_response.hover_pos()
+                        && axis_hit.contains(pointer)
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                });
+                    if plot_response.clicked()
+                        && let Some(pointer) = plot_response.interact_pointer_pos()
+                        && axis_hit.contains(pointer)
+                        && let Some(sequence) = sequence
+                        && !sequence.frames.is_empty()
+                    {
+                        let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                        let target_offset = span.as_secs_f64() * fraction as f64;
+                        seek_frame = sequence
+                            .frames
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                let a_offset = a
+                                    .timestamp
+                                    .duration_since(start_time)
+                                    .unwrap_or_default()
+                                    .as_secs_f64();
+                                let b_offset = b
+                                    .timestamp
+                                    .duration_since(start_time)
+                                    .unwrap_or_default()
+                                    .as_secs_f64();
+                                (a_offset - target_offset)
+                                    .abs()
+                                    .total_cmp(&(b_offset - target_offset).abs())
+                            })
+                            .map(|(index, _)| index);
+                    }
+                }
             });
+
         if let Some(response) = response {
             self.shape_plot_window_pos = response.response.rect.min;
             self.shape_plot_window_size = response.response.rect.size();
         }
         self.shape_plot_open = open;
+
+        if let Some(frame) = seek_frame {
+            self.seek_sequence_frame(frame);
+        }
     }
 
     fn save_original(&mut self) {
@@ -3254,6 +3359,7 @@ impl eframe::App for GreenViewerApp {
         self.poll_yolo_worker(&ctx);
         self.poll_processing_worker(&ctx);
         self.tick_continuous_capture(&ctx);
+        self.handle_global_shortcuts(&ctx);
         self.tick_sequence_playback(&ctx);
 
         egui::CentralPanel::default().show(ui, |ui| self.previews(ui));
@@ -3293,7 +3399,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.7.3")
+        .user_agent("rust-edge-gui/0.7.4")
         .build()
         .expect("failed to build HTTP client");
 

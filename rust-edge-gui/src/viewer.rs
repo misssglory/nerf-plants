@@ -48,6 +48,7 @@ impl ImageViewState {
 
 #[derive(Clone, Debug)]
 pub struct OverlayPoint {
+    pub id: Option<u64>,
     pub pixel: (u32, u32),
     pub color: egui::Color32,
     pub label: String,
@@ -56,6 +57,7 @@ pub struct OverlayPoint {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ViewInteraction {
     pub pivot_pixel: Option<(u32, u32)>,
+    pub toggle_overlay_id: Option<u64>,
 }
 
 pub fn show_floating_image_window(
@@ -231,6 +233,28 @@ fn show_image_window_contents(
         egui::Color32::WHITE,
     );
 
+    let hover_pos = response.hover_pos().filter(|pointer| image_rect.contains(*pointer));
+    let hovered_overlay_id = hover_pos.and_then(|pointer| {
+        overlays
+            .iter()
+            .filter_map(|point| {
+                let id = point.id?;
+                let px = point.pixel.0 as f32 + 0.5;
+                let py = point.pixel.1 as f32 + 0.5;
+                if px < 0.0 || py < 0.0 || px >= image_size.x || py >= image_size.y {
+                    return None;
+                }
+                let screen = egui::pos2(
+                    image_rect.min.x + px / image_size.x * image_rect.width(),
+                    image_rect.min.y + py / image_size.y * image_rect.height(),
+                );
+                let distance_sq = screen.distance_sq(pointer);
+                (distance_sq <= 14.0 * 14.0).then_some((id, distance_sq))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
+    });
+
     for point in overlays {
         let px = point.pixel.0 as f32 + 0.5;
         let py = point.pixel.1 as f32 + 0.5;
@@ -239,14 +263,19 @@ fn show_image_window_contents(
                 image_rect.min.x + px / image_size.x * image_rect.width(),
                 image_rect.min.y + py / image_size.y * image_rect.height(),
             );
-            painter.circle_filled(screen, 5.0, point.color);
-            painter.circle_stroke(screen, 8.0, egui::Stroke::new(1.5, point.color));
+            let color = if point.id.is_some() && point.id == hovered_overlay_id {
+                egui::Color32::YELLOW
+            } else {
+                point.color
+            };
+            painter.circle_filled(screen, 5.0, color);
+            painter.circle_stroke(screen, 8.0, egui::Stroke::new(1.5, color));
             painter.text(
                 screen + egui::vec2(10.0, -10.0),
                 egui::Align2::LEFT_BOTTOM,
                 &point.label,
                 egui::FontId::monospace(11.0),
-                point.color,
+                color,
             );
         }
     }
@@ -259,7 +288,11 @@ fn show_image_window_contents(
             let x = (u * image_size.x).floor() as u32;
             let y = (v * image_size.y).floor() as u32;
             if allow_pivot_hotkey && ui.input(|input| input.key_pressed(egui::Key::P)) {
-                interaction.pivot_pixel = Some((x, y));
+                if let Some(track_id) = hovered_overlay_id {
+                    interaction.toggle_overlay_id = Some(track_id);
+                } else {
+                    interaction.pivot_pixel = Some((x, y));
+                }
             }
 
             if let Some(source) = pixel_source {

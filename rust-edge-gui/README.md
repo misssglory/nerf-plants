@@ -1,8 +1,17 @@
-# rust-edge-gui 0.7.3
+# rust-edge-gui 0.7.4
 
 Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, native offline YOLO segmentation, per-window navigation, sequence playback, temporal false-positive filtering, and tracked mask-area plots.
 
 
+
+
+## What changed in 0.7.4
+
+- Plot window height is stable and resizable; adding tracks no longer changes its height recursively.
+- Hover a tracked pivot/marker to highlight it yellow; press `P` while hovered to remove it.
+- `Space` globally toggles sequence play/pause unless a text field is being edited.
+- Click the plot X-axis to jump to the nearest frame by absolute timestamp. This can be disabled with `Click plot X-axis to seek frame` in Sequence mask tracking.
+- The click-to-seek setting persists across app relaunches.
 
 ## What changed in 0.7.3
 
