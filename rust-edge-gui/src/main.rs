@@ -1,4 +1,5 @@
 mod viewer;
+mod yolo;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -10,13 +11,59 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context as _, Result};
 use chrono::{DateTime, Local};
 use eframe::egui;
-use image::{DynamicImage, GrayImage, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, RgbaImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-const APP_TITLE: &str = "Rust Edge GUI — Green Shape + Edge Composer";
+use yolo::{
+    YoloDevice, YoloMessage, YoloModelInfo, YoloPostSettings, YoloRequest,
+    YoloRuntimeSettings, YoloWorker,
+};
+
+const APP_TITLE: &str = "Rust Edge GUI — Plant Mask + YOLO Segmentation";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetectionMode {
+    LegacyGreen,
+    PlantIndex,
+    Yolo,
+    Hybrid,
+}
+
+impl DetectionMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::LegacyGreen => "Legacy green excess",
+            Self::PlantIndex => "RG/B plant index",
+            Self::Yolo => "YOLO segmentation",
+            Self::Hybrid => "Hybrid: YOLO ∩ color",
+        }
+    }
+
+    const fn uses_yolo(self) -> bool {
+        matches!(self, Self::Yolo | Self::Hybrid)
+    }
+
+    const fn persisted(self) -> &'static str {
+        match self {
+            Self::LegacyGreen => "legacy",
+            Self::PlantIndex => "plant-index",
+            Self::Yolo => "yolo",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
+    fn from_persisted(value: &str) -> Self {
+        match value {
+            "legacy" => Self::LegacyGreen,
+            "yolo" => Self::Yolo,
+            "hybrid" => Self::Hybrid,
+            _ => Self::PlantIndex,
+        }
+    }
+}
 
 fn main() -> eframe::Result {
     let initial_source = std::env::args().nth(1);
@@ -41,6 +88,11 @@ fn main() -> eframe::Result {
 struct GreenSettings {
     green_excess_threshold: f32,
     green_ratio_threshold: f32,
+    blue_deficit_threshold: f32,
+    plant_index_threshold: f32,
+    min_green_red_ratio: f32,
+    min_rg_brightness: f32,
+    hybrid_color_expand: u32,
     min_component_area: usize,
     grow_radius: u32,
     fill_color: egui::Color32,
@@ -59,6 +111,11 @@ impl Default for GreenSettings {
         Self {
             green_excess_threshold: 28.0,
             green_ratio_threshold: 0.38,
+            blue_deficit_threshold: 28.0,
+            plant_index_threshold: 0.28,
+            min_green_red_ratio: 0.72,
+            min_rg_brightness: 35.0,
+            hybrid_color_expand: 3,
             min_component_area: 80,
             grow_radius: 1,
             fill_color: egui::Color32::from_rgb(35, 255, 105),
@@ -80,6 +137,8 @@ struct ProcessingRequest {
     rgba: Arc<RgbaImage>,
     gray: Arc<GrayImage>,
     settings: GreenSettings,
+    detection_mode: DetectionMode,
+    ai_mask: Option<Arc<Vec<bool>>>,
 }
 
 struct ProcessingResult {
@@ -195,6 +254,20 @@ struct PersistedState {
     capture_base_dir: String,
     #[serde(default)]
     capture_interval_secs: f32,
+    #[serde(default)]
+    detection_mode: String,
+    #[serde(default)]
+    yolo_model_path: String,
+    #[serde(default)]
+    yolo_class_ids: String,
+    #[serde(default)]
+    yolo_confidence: f32,
+    #[serde(default)]
+    yolo_iou: f32,
+    #[serde(default)]
+    yolo_mask_threshold: f32,
+    #[serde(default)]
+    yolo_input_size: usize,
 }
 
 #[derive(Clone)]
@@ -243,10 +316,12 @@ struct GreenViewerApp {
     source_loading: bool,
 
     settings: GreenSettings,
+    detection_mode: DetectionMode,
     dirty: bool,
     update_while_dragging: bool,
 
     processing_worker: ProcessingWorker,
+    yolo_worker: YoloWorker,
     next_job_id: u64,
     active_job_id: u64,
     processing: bool,
@@ -256,6 +331,24 @@ struct GreenViewerApp {
     shape_count: usize,
     green_pixels: usize,
     boundary_pixels: usize,
+    ai_mask: Option<Arc<Vec<bool>>>,
+    ai_mask_rgba: Option<RgbaImage>,
+    ai_mask_texture: Option<egui::TextureHandle>,
+    ai_view: viewer::ImageViewState,
+    yolo_model_path_input: String,
+    yolo_class_ids_input: String,
+    yolo_confidence: f32,
+    yolo_iou: f32,
+    yolo_mask_threshold: f32,
+    yolo_input_size: usize,
+    yolo_device: YoloDevice,
+    yolo_model_generation: u64,
+    yolo_fallback_color: bool,
+    yolo_model_info: Option<YoloModelInfo>,
+    yolo_instance_count: usize,
+    yolo_mask_pixels: usize,
+    yolo_elapsed_ms: f64,
+    yolo_summary: String,
     status: String,
     error: Option<String>,
 
@@ -290,6 +383,36 @@ impl GreenViewerApp {
         } else {
             2.0
         };
+        let detection_mode = DetectionMode::from_persisted(&persisted.detection_mode);
+        let yolo_model_path_input = if persisted.yolo_model_path.trim().is_empty() {
+            "yolo26n-seg.onnx".to_owned()
+        } else {
+            persisted.yolo_model_path.clone()
+        };
+        let yolo_class_ids_input = if persisted.yolo_class_ids.trim().is_empty() {
+            "58".to_owned()
+        } else {
+            persisted.yolo_class_ids.clone()
+        };
+        let yolo_confidence = if (0.01..=1.0).contains(&persisted.yolo_confidence) {
+            persisted.yolo_confidence
+        } else {
+            0.25
+        };
+        let yolo_iou = if (0.01..=1.0).contains(&persisted.yolo_iou) {
+            persisted.yolo_iou
+        } else {
+            0.70
+        };
+        let yolo_mask_threshold = if (0.01..=1.0).contains(&persisted.yolo_mask_threshold) {
+            persisted.yolo_mask_threshold
+        } else {
+            0.50
+        };
+        let yolo_input_size = match persisted.yolo_input_size {
+            320 | 512 | 640 | 768 | 1024 | 1280 => persisted.yolo_input_size,
+            _ => 640,
+        };
 
         let mut app = Self {
             original_rgba: None,
@@ -309,9 +432,11 @@ impl GreenViewerApp {
             active_source_id: 0,
             source_loading: false,
             settings: GreenSettings::default(),
+            detection_mode,
             dirty: false,
             update_while_dragging: true,
             processing_worker: ProcessingWorker::spawn(cc.egui_ctx.clone()),
+            yolo_worker: YoloWorker::spawn(cc.egui_ctx.clone()),
             next_job_id: 0,
             active_job_id: 0,
             processing: false,
@@ -320,6 +445,27 @@ impl GreenViewerApp {
             shape_count: 0,
             green_pixels: 0,
             boundary_pixels: 0,
+            ai_mask: None,
+            ai_mask_rgba: None,
+            ai_mask_texture: None,
+            ai_view: viewer::ImageViewState {
+                open: false,
+                ..Default::default()
+            },
+            yolo_model_path_input,
+            yolo_class_ids_input,
+            yolo_confidence,
+            yolo_iou,
+            yolo_mask_threshold,
+            yolo_input_size,
+            yolo_device: YoloDevice::Auto,
+            yolo_model_generation: 0,
+            yolo_fallback_color: true,
+            yolo_model_info: None,
+            yolo_instance_count: 0,
+            yolo_mask_pixels: 0,
+            yolo_elapsed_ms: 0.0,
+            yolo_summary: "No YOLO inference yet".to_owned(),
             status: "Open an image from disk or enter a camera IP/address.".to_owned(),
             error: None,
             original_view: viewer::ImageViewState::default(),
@@ -484,6 +630,13 @@ impl GreenViewerApp {
             sequence_history: self.sequence_history.clone(),
             capture_base_dir: self.capture_base_dir_input.clone(),
             capture_interval_secs: self.capture_interval_secs,
+            detection_mode: self.detection_mode.persisted().to_owned(),
+            yolo_model_path: self.yolo_model_path_input.clone(),
+            yolo_class_ids: self.yolo_class_ids_input.clone(),
+            yolo_confidence: self.yolo_confidence,
+            yolo_iou: self.yolo_iou,
+            yolo_mask_threshold: self.yolo_mask_threshold,
+            yolo_input_size: self.yolo_input_size,
         });
     }
 
@@ -722,40 +875,161 @@ impl GreenViewerApp {
     }
 
     fn schedule_processing(&mut self) {
-        let (Some(rgba), Some(gray)) = (self.original_rgba.as_ref(), self.original_gray.as_ref())
-        else {
+        if self.original_rgba.is_none() || self.original_gray.is_none() {
             return;
-        };
+        }
 
         self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
         self.active_job_id = self.next_job_id;
         self.processing_worker
             .latest_id
             .store(self.active_job_id, Ordering::Release);
+        self.yolo_worker
+            .latest_id
+            .store(self.active_job_id, Ordering::Release);
 
+        self.processing = true;
+        self.progress = 0.0;
+        self.dirty = false;
+        self.error = None;
+
+        if self.detection_mode.uses_yolo() {
+            let class_ids = match parse_class_ids(&self.yolo_class_ids_input) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    self.processing = false;
+                    self.error = Some(error.to_string());
+                    return;
+                }
+            };
+            let runtime = YoloRuntimeSettings {
+                model_path: self.yolo_model_path_input.trim().to_owned(),
+                confidence: self.yolo_confidence,
+                iou: self.yolo_iou,
+                input_size: self.yolo_input_size,
+                device: self.yolo_device,
+                generation: self.yolo_model_generation,
+            };
+            let rgba = Arc::clone(self.original_rgba.as_ref().expect("checked above"));
+            let request = YoloRequest {
+                id: self.active_job_id,
+                rgba,
+                source_label: self.source_label.clone(),
+                runtime,
+                post: YoloPostSettings {
+                    class_ids,
+                    mask_threshold: self.yolo_mask_threshold,
+                },
+            };
+            match self.yolo_worker.tx.send(request) {
+                Ok(()) => {
+                    self.progress = 0.04;
+                    self.progress_stage = "YOLO segmentation".to_owned();
+                }
+                Err(error) => {
+                    self.processing = false;
+                    self.error = Some(format!("YOLO worker stopped: {error}"));
+                }
+            }
+        } else {
+            // Do not leave an old YOLO preview visible after switching back to a color-only mode.
+            self.ai_mask = None;
+            self.ai_mask_rgba = None;
+            self.ai_mask_texture = None;
+            self.yolo_mask_pixels = 0;
+            self.yolo_instance_count = 0;
+            self.submit_processing_request(self.active_job_id, self.detection_mode, None);
+        }
+    }
+
+    fn submit_processing_request(
+        &mut self,
+        id: u64,
+        detection_mode: DetectionMode,
+        ai_mask: Option<Arc<Vec<bool>>>,
+    ) {
+        let (Some(rgba), Some(gray)) = (self.original_rgba.as_ref(), self.original_gray.as_ref())
+        else {
+            self.processing = false;
+            return;
+        };
         let request = ProcessingRequest {
-            id: self.active_job_id,
+            id,
             rgba: Arc::clone(rgba),
             gray: Arc::clone(gray),
             settings: self.settings.clone(),
+            detection_mode,
+            ai_mask,
         };
-
         match self.processing_worker.job_tx.send(request) {
             Ok(()) => {
                 self.processing = true;
-                self.progress = 0.0;
-                self.progress_stage = "Queued".to_owned();
-                self.dirty = false;
-                self.error = None;
-                if let Some(pending) = self.pending_capture.as_mut() {
-                    if pending.processing_job_id.is_some() {
-                        pending.processing_job_id = Some(self.active_job_id);
-                    }
-                }
+                self.progress = if detection_mode.uses_yolo() { 0.52 } else { 0.0 };
+                self.progress_stage = "Building final plant mask".to_owned();
             }
             Err(error) => {
                 self.processing = false;
                 self.error = Some(format!("Processing worker stopped: {error}"));
+            }
+        }
+    }
+
+    fn poll_yolo_worker(&mut self, ctx: &egui::Context) {
+        while let Ok(message) = self.yolo_worker.rx.try_recv() {
+            match message {
+                YoloMessage::Finished { id, output } if id == self.active_job_id => {
+                    let mask = Arc::new(output.mask);
+                    self.yolo_model_info = Some(output.model_info);
+                    self.yolo_instance_count = output.instance_count;
+                    self.yolo_mask_pixels = output.mask_pixels;
+                    self.yolo_elapsed_ms = output.elapsed_ms;
+                    self.yolo_summary = output.summary;
+                    self.ai_mask = Some(Arc::clone(&mask));
+
+                    let preview = mask_to_rgba(&mask, output.width, output.height);
+                    let color_image = rgba_to_color_image(&preview);
+                    if let Some(texture) = self.ai_mask_texture.as_mut() {
+                        texture.set(color_image, egui::TextureOptions::NEAREST);
+                    } else {
+                        self.ai_mask_texture = Some(ctx.load_texture(
+                            "yolo-mask-image",
+                            color_image,
+                            egui::TextureOptions::NEAREST,
+                        ));
+                    }
+                    self.ai_mask_rgba = Some(preview);
+                    self.progress = 0.50;
+                    self.progress_stage = "YOLO mask ready; compositing".to_owned();
+                    self.submit_processing_request(id, self.detection_mode, Some(mask));
+                }
+                YoloMessage::Failed { id, error } if id == self.active_job_id => {
+                    self.ai_mask = None;
+                    self.ai_mask_rgba = None;
+                    self.ai_mask_texture = None;
+                    self.yolo_model_info = None;
+                    self.yolo_instance_count = 0;
+                    self.yolo_mask_pixels = 0;
+                    self.yolo_elapsed_ms = 0.0;
+                    self.yolo_summary = error.clone();
+                    if self.yolo_fallback_color {
+                        self.status = format!("{error}; falling back to RG/B plant index");
+                        self.progress_stage = "YOLO failed; color fallback".to_owned();
+                        self.submit_processing_request(id, DetectionMode::PlantIndex, None);
+                    } else {
+                        self.processing = false;
+                        self.progress_stage = "YOLO failed".to_owned();
+                        if self
+                            .pending_capture
+                            .as_ref()
+                            .and_then(|pending| pending.processing_job_id)
+                            .is_some_and(|job_id| job_id == id)
+                        {
+                            self.pending_capture = None;
+                        }
+                        self.error = Some(error);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -790,7 +1064,7 @@ impl GreenViewerApp {
                         ));
                     }
                     self.status = format!(
-                        "Detected {} green shape(s), {} green px, {} boundary px",
+                        "Detected {} mask component(s), {} plant px, {} boundary px",
                         self.shape_count, self.green_pixels, self.boundary_pixels
                     );
                     self.error = None;
@@ -836,7 +1110,7 @@ impl GreenViewerApp {
 
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Rust Edge GUI");
-        ui.small("Disk or camera IP input → automatic green-shape processing.");
+        ui.small("Disk or camera IP input → color/YOLO plant segmentation.");
         ui.separator();
 
         ui.label("Camera IP / address");
@@ -1008,35 +1282,254 @@ impl GreenViewerApp {
         ui.collapsing("Image windows", |ui| {
             ui.checkbox(&mut self.original_view.open, "Show original");
             ui.checkbox(&mut self.processed_view.open, "Show processed");
+            ui.checkbox(&mut self.ai_view.open, "Show AI mask");
             ui.checkbox(&mut self.link_views, "Link pan + zoom");
             ui.horizontal(|ui| {
-                if ui.button("Fit both").clicked() {
+                if ui.button("Fit all").clicked() {
                     self.original_view.reset_fit();
                     self.processed_view.reset_fit();
+                    self.ai_view.reset_fit();
                 }
                 if ui.button("Processed ← Original").clicked() {
                     self.processed_view.copy_transform_from(&self.original_view);
+                    self.ai_view.copy_transform_from(&self.original_view);
                 }
             });
         });
 
         ui.separator();
-        ui.heading("Green detection");
+        ui.heading("Plant detection / mask source");
         let mut changed = false;
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.settings.green_excess_threshold, 0.0..=180.0)
-                    .text("Green excess")
-                    .fixed_decimals(1),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.settings.green_ratio_threshold, 0.0..=1.0)
-                    .text("Green ratio")
-                    .fixed_decimals(2),
-            )
-            .changed();
+        let mut force_run = false;
+        let previous_mode = self.detection_mode;
+        egui::ComboBox::from_label("Detection mode")
+            .selected_text(self.detection_mode.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.detection_mode,
+                    DetectionMode::PlantIndex,
+                    DetectionMode::PlantIndex.label(),
+                );
+                ui.selectable_value(
+                    &mut self.detection_mode,
+                    DetectionMode::Yolo,
+                    DetectionMode::Yolo.label(),
+                );
+                ui.selectable_value(
+                    &mut self.detection_mode,
+                    DetectionMode::Hybrid,
+                    DetectionMode::Hybrid.label(),
+                );
+                ui.selectable_value(
+                    &mut self.detection_mode,
+                    DetectionMode::LegacyGreen,
+                    DetectionMode::LegacyGreen.label(),
+                );
+            });
+        if self.detection_mode != previous_mode {
+            changed = true;
+            self.save_preferences();
+        }
+
+        match self.detection_mode {
+            DetectionMode::LegacyGreen => {
+                ui.small("Legacy rule: G - max(R,B) + green ratio. Kept for compatibility.");
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.green_excess_threshold, -80.0..=180.0)
+                            .text("Green excess")
+                            .fixed_decimals(1),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.green_ratio_threshold, 0.0..=1.0)
+                            .text("Green ratio")
+                            .fixed_decimals(2),
+                    )
+                    .changed();
+            }
+            DetectionMode::PlantIndex | DetectionMode::Hybrid => {
+                ui.small("RG/B rule: high red+green, low blue; designed for top-view plant cameras.");
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.blue_deficit_threshold, -20.0..=160.0)
+                            .text("Blue deficit: (R+G)/2 - B")
+                            .fixed_decimals(1),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.plant_index_threshold, -0.5..=1.0)
+                            .text("Plant index")
+                            .fixed_decimals(2),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.min_green_red_ratio, 0.0..=1.5)
+                            .text("Min G/R")
+                            .fixed_decimals(2),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.min_rg_brightness, 0.0..=255.0)
+                            .text("Min RG brightness")
+                            .fixed_decimals(0),
+                    )
+                    .changed();
+                if self.detection_mode == DetectionMode::Hybrid {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.settings.hybrid_color_expand, 0..=24)
+                                .text("Hybrid color gate expand"),
+                        )
+                        .changed();
+                }
+            }
+            DetectionMode::Yolo => {}
+        }
+
+        if self.detection_mode.uses_yolo() {
+            ui.add_space(5.0);
+            ui.group(|ui| {
+                ui.strong("YOLO segmentation (offline ONNX)");
+                ui.horizontal(|ui| {
+                    let model_response = ui.add(
+                        egui::TextEdit::singleline(&mut self.yolo_model_path_input)
+                            .hint_text("/path/to/best.onnx"),
+                    );
+                    if model_response.changed() {
+                        changed = true;
+                    }
+                    if ui.small_button("…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose YOLO segmentation ONNX model")
+                            .add_filter("ONNX model", &["onnx"])
+                            .pick_file()
+                        {
+                            self.yolo_model_path_input = path.display().to_string();
+                            self.yolo_model_generation = self.yolo_model_generation.wrapping_add(1);
+                            changed = true;
+                            self.save_preferences();
+                        }
+                    }
+                });
+                ui.small("Select a local Ultralytics segmentation .onnx file. Inference stays offline after the model is on disk.");
+
+                ui.horizontal(|ui| {
+                    ui.label("Plant class IDs");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.yolo_class_ids_input)
+                                .desired_width(95.0)
+                                .hint_text("0 or 0,1"),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui.small_button("Custom: 0").clicked() {
+                        self.yolo_class_ids_input = "0".to_owned();
+                        changed = true;
+                    }
+                    if ui.small_button("COCO plant: 58").clicked() {
+                        self.yolo_class_ids_input = "58".to_owned();
+                        changed = true;
+                    }
+                });
+                ui.small("Instance-seg: empty = accept every detected class. Semantic-seg: class IDs are required.");
+
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.yolo_confidence, 0.01..=1.0)
+                            .text("Confidence")
+                            .fixed_decimals(2),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.yolo_iou, 0.05..=0.95)
+                            .text("NMS IoU")
+                            .fixed_decimals(2),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.yolo_mask_threshold, 0.05..=0.95)
+                            .text("Mask threshold")
+                            .fixed_decimals(2),
+                    )
+                    .changed();
+
+                ui.horizontal(|ui| {
+                    ui.label("Input size");
+                    egui::ComboBox::from_id_salt("yolo-imgsz")
+                        .selected_text(self.yolo_input_size.to_string())
+                        .show_ui(ui, |ui| {
+                            for size in [320usize, 512, 640, 768, 1024, 1280] {
+                                if ui
+                                    .selectable_value(&mut self.yolo_input_size, size, size.to_string())
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    ui.label("Device");
+                    egui::ComboBox::from_id_salt("yolo-device")
+                        .selected_text(self.yolo_device.label())
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(&mut self.yolo_device, YoloDevice::Auto, "Auto")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            if ui
+                                .selectable_value(&mut self.yolo_device, YoloDevice::Cpu, "CPU")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        });
+                });
+                ui.checkbox(&mut self.yolo_fallback_color, "Fallback to RG/B mask if YOLO fails");
+
+                ui.horizontal(|ui| {
+                    if ui.button("Reload model + run").clicked() {
+                        self.yolo_model_generation = self.yolo_model_generation.wrapping_add(1);
+                        force_run = true;
+                        self.save_preferences();
+                    }
+                    if self.ai_mask_rgba.is_some() && ui.button("Save AI mask…").clicked() {
+                        self.save_ai_mask();
+                    }
+                });
+
+                if let Some(info) = self.yolo_model_info.as_ref() {
+                    ui.small(format!(
+                        "{} · {} · {} classes · {}×{} · {}",
+                        info.task,
+                        info.provider,
+                        info.class_count,
+                        info.input_size.1,
+                        info.input_size.0,
+                        info.model_path
+                    ));
+                }
+                ui.small(format!(
+                    "AI: {} · {} px · {:.1} ms · {}",
+                    self.yolo_instance_count,
+                    self.yolo_mask_pixels,
+                    self.yolo_elapsed_ms,
+                    self.yolo_summary
+                ));
+            });
+        }
+
+        ui.add_space(5.0);
         changed |= ui
             .add(
                 egui::Slider::new(&mut self.settings.min_component_area, 1..=100_000)
@@ -1045,7 +1538,7 @@ impl GreenViewerApp {
             )
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut self.settings.grow_radius, 0..=12).text("Mask grow"))
+            .add(egui::Slider::new(&mut self.settings.grow_radius, 0..=12).text("Final mask grow"))
             .changed();
         changed |= ui
             .add(
@@ -1073,7 +1566,6 @@ impl GreenViewerApp {
                 .add(egui::Slider::new(&mut self.settings.outline_opacity, 0..=255).text("α"))
                 .changed();
         });
-
         ui.separator();
         ui.collapsing("Additional edge overlay", |ui| {
             changed |= ui
@@ -1104,9 +1596,17 @@ impl GreenViewerApp {
 
         if changed {
             self.dirty = true;
+            self.save_preferences();
         }
         let pointer_down = ui.input(|input| input.pointer.primary_down());
-        if self.dirty && (self.update_while_dragging || !pointer_down) {
+        let cheap_auto_reprocess = !self.detection_mode.uses_yolo();
+        if self.dirty
+            && cheap_auto_reprocess
+            && (self.update_while_dragging || !pointer_down)
+        {
+            self.schedule_processing();
+        }
+        if force_run {
             self.schedule_processing();
         }
         if ui
@@ -1115,14 +1615,17 @@ impl GreenViewerApp {
         {
             self.schedule_processing();
         }
+        if self.detection_mode.uses_yolo() {
+            ui.small("YOLO/Hybrid parameter edits wait for Apply to avoid running inference on every slider tick.");
+        }
 
         ui.separator();
         ui.label(format!("Source: {}", self.source_label));
         if let Some(gray) = self.original_gray.as_ref() {
             ui.label(format!("Resolution: {} × {}", gray.width(), gray.height()));
         }
-        ui.label(format!("Green shapes: {}", self.shape_count));
-        ui.label(format!("Green pixels: {}", self.green_pixels));
+        ui.label(format!("Mask components: {}", self.shape_count));
+        ui.label(format!("Mask pixels: {}", self.green_pixels));
         ui.label(format!("Boundary pixels: {}", self.boundary_pixels));
         ui.small("Workers block on recv() while idle. A repaint timer is only scheduled while continuous capture is active.");
     }
@@ -1178,9 +1681,10 @@ impl GreenViewerApp {
             ui.strong("Floating image windows");
             ui.checkbox(&mut self.original_view.open, "Original");
             ui.checkbox(&mut self.processed_view.open, "Processed");
+            ui.checkbox(&mut self.ai_view.open, "AI mask");
             ui.checkbox(&mut self.link_views, "Link views");
         });
-        ui.small("Resize each window. Fit follows its borders. Drag the image to pan; pinch/Ctrl+wheel zooms around the cursor.");
+        ui.small("Original has a pixel inspector. Resize windows; drag to pan; pinch/Ctrl+wheel zooms around the cursor.");
         ui.allocate_space(ui.available_size());
 
         let ctx = ui.ctx().clone();
@@ -1194,11 +1698,12 @@ impl GreenViewerApp {
         );
         if self.link_views && original_interaction.transform_changed {
             self.processed_view.copy_transform_from(&self.original_view);
+            self.ai_view.copy_transform_from(&self.original_view);
         }
 
         let processed_interaction = viewer::show_floating_image_window(
             &ctx,
-            "Processed — green shapes",
+            "Processed — final plant mask",
             self.processed_texture.as_ref(),
             None,
             &mut self.processed_view,
@@ -1209,6 +1714,24 @@ impl GreenViewerApp {
             && !original_interaction.transform_changed
         {
             self.original_view.copy_transform_from(&self.processed_view);
+            self.ai_view.copy_transform_from(&self.processed_view);
+        }
+
+        let ai_interaction = viewer::show_floating_image_window(
+            &ctx,
+            "YOLO raw plant mask",
+            self.ai_mask_texture.as_ref(),
+            self.ai_mask_rgba.as_ref(),
+            &mut self.ai_view,
+            egui::pos2(1030.0, 220.0),
+        );
+        if self.link_views
+            && ai_interaction.transform_changed
+            && !original_interaction.transform_changed
+            && !processed_interaction.transform_changed
+        {
+            self.original_view.copy_transform_from(&self.ai_view);
+            self.processed_view.copy_transform_from(&self.ai_view);
         }
     }
 
@@ -1246,7 +1769,35 @@ impl GreenViewerApp {
         };
         let Some(path) = rfd::FileDialog::new()
             .set_title("Save processed image")
-            .set_file_name("green_shapes.png")
+            .set_file_name("plant_mask_processed.png")
+            .add_filter("PNG", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let mut path = path;
+        if path.extension().is_none() {
+            path.set_extension("png");
+        }
+        match DynamicImage::ImageRgba8(image.clone()).save(&path) {
+            Ok(()) => {
+                self.status = format!("Saved {}", path.display());
+                self.error = None;
+            }
+            Err(error) => {
+                self.error = Some(format!("Failed to save {}: {error}", path.display()));
+            }
+        }
+    }
+
+    fn save_ai_mask(&mut self) {
+        let Some(image) = self.ai_mask_rgba.as_ref() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save raw YOLO mask")
+            .set_file_name("yolo_plant_mask.png")
             .add_filter("PNG", &["png"])
             .save_file()
         else {
@@ -1274,6 +1825,7 @@ impl eframe::App for GreenViewerApp {
         let ctx = ui.ctx().clone();
         self.handle_dropped_files(&ctx);
         self.poll_source_worker(&ctx);
+        self.poll_yolo_worker(&ctx);
         self.poll_processing_worker(&ctx);
         self.tick_continuous_capture(&ctx);
 
@@ -1325,7 +1877,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.5")
+        .user_agent("rust-edge-gui/0.6")
         .build()
         .expect("failed to build HTTP client");
 
@@ -1508,6 +2060,14 @@ fn processing_loop(
     }
 }
 
+fn pipeline_progress(mode: DetectionMode, value: f32) -> f32 {
+    if mode.uses_yolo() {
+        0.52 + value.clamp(0.0, 1.0) * 0.48
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
 fn process_image(
     request: &ProcessingRequest,
     latest_id: &AtomicU64,
@@ -1517,7 +2077,13 @@ fn process_image(
     let id = request.id;
     let cancelled = || latest_id.load(Ordering::Acquire) != id;
 
-    progress(progress_tx, repaint_ctx, id, 0.05, "Finding green pixels");
+    progress(
+        progress_tx,
+        repaint_ctx,
+        id,
+        pipeline_progress(request.detection_mode, 0.05),
+        "Building source mask",
+    );
     let width = request.rgba.width();
     let height = request.rgba.height();
     if width == 0 || height == 0 {
@@ -1525,27 +2091,50 @@ fn process_image(
     }
 
     let settings = &request.settings;
-    let mut raw_mask: Vec<bool> = request
-        .rgba
-        .as_raw()
-        .par_chunks_exact(4)
-        .map(|pixel| {
-            let r = pixel[0] as f32;
-            let g = pixel[1] as f32;
-            let b = pixel[2] as f32;
-            let green_excess = g - r.max(b);
-            let green_ratio = g / (r + g + b + 1.0);
-            green_excess >= settings.green_excess_threshold
-                && green_ratio >= settings.green_ratio_threshold
-        })
-        .collect();
+    let color_mask = || plant_index_mask(&request.rgba, settings);
+    let mut raw_mask: Vec<bool> = match request.detection_mode {
+        DetectionMode::LegacyGreen => legacy_green_mask(&request.rgba, settings),
+        DetectionMode::PlantIndex => color_mask(),
+        DetectionMode::Yolo => request
+            .ai_mask
+            .as_ref()
+            .filter(|mask| mask.len() == (width * height) as usize)
+            .map(|mask| mask.as_ref().clone())
+            .ok_or_else(|| anyhow!("YOLO mode has no valid AI mask"))?,
+        DetectionMode::Hybrid => {
+            let ai = request
+                .ai_mask
+                .as_ref()
+                .filter(|mask| mask.len() == (width * height) as usize)
+                .ok_or_else(|| anyhow!("Hybrid mode has no valid AI mask"))?;
+            let mut color = color_mask();
+            if settings.hybrid_color_expand > 0 {
+                color = dilate_mask(
+                    &color,
+                    width as usize,
+                    height as usize,
+                    settings.hybrid_color_expand as usize,
+                );
+            }
+            ai.iter()
+                .zip(color.iter())
+                .map(|(&ai_pixel, &color_pixel)| ai_pixel && color_pixel)
+                .collect()
+        }
+    };
 
     if cancelled() {
         return Ok(None);
     }
 
     if settings.grow_radius > 0 {
-        progress(progress_tx, repaint_ctx, id, 0.22, "Growing green mask");
+        progress(
+            progress_tx,
+            repaint_ctx,
+            id,
+            pipeline_progress(request.detection_mode, 0.22),
+            "Growing plant mask",
+        );
         raw_mask = dilate_mask(
             &raw_mask,
             width as usize,
@@ -1558,7 +2147,13 @@ fn process_image(
         return Ok(None);
     }
 
-    progress(progress_tx, repaint_ctx, id, 0.35, "Finding green shapes");
+    progress(
+        progress_tx,
+        repaint_ctx,
+        id,
+        pipeline_progress(request.detection_mode, 0.35),
+        "Filtering plant components",
+    );
     let (shape_mask, shape_count) = keep_components(
         &raw_mask,
         width as usize,
@@ -1571,14 +2166,26 @@ fn process_image(
         return Ok(None);
     };
 
-    progress(progress_tx, repaint_ctx, id, 0.58, "Building outlines");
+    progress(
+        progress_tx,
+        repaint_ctx,
+        id,
+        pipeline_progress(request.detection_mode, 0.58),
+        "Building outlines",
+    );
     let boundary = boundary_mask(&shape_mask, width as usize, height as usize);
 
     if cancelled() {
         return Ok(None);
     }
 
-    progress(progress_tx, repaint_ctx, id, 0.70, "Compositing result");
+    progress(
+        progress_tx,
+        repaint_ctx,
+        id,
+        pipeline_progress(request.detection_mode, 0.70),
+        "Compositing result",
+    );
     let mut processed = dim_image(&request.rgba, settings.dimness);
     alpha_paint_mask(
         &mut processed,
@@ -1594,7 +2201,13 @@ fn process_image(
     );
 
     if settings.edge_enabled {
-        progress(progress_tx, repaint_ctx, id, 0.82, "Detecting additional edges");
+        progress(
+            progress_tx,
+            repaint_ctx,
+            id,
+            pipeline_progress(request.detection_mode, 0.82),
+            "Detecting additional edges",
+        );
         let edge_mask = sobel_edges(&request.gray, settings.edge_threshold, latest_id, id);
         let Some(edge_mask) = edge_mask else {
             return Ok(None);
@@ -1613,7 +2226,13 @@ fn process_image(
 
     let green_pixels = shape_mask.iter().filter(|&&v| v).count();
     let boundary_pixels = boundary.iter().filter(|&&v| v).count();
-    progress(progress_tx, repaint_ctx, id, 1.0, "Complete");
+    progress(
+        progress_tx,
+        repaint_ctx,
+        id,
+        pipeline_progress(request.detection_mode, 1.0),
+        "Complete",
+    );
 
     Ok(Some(ProcessingResult {
         processed,
@@ -1632,6 +2251,86 @@ fn progress(
 ) {
     let _ = tx.send(ProcessingMessage::Progress { id, value, stage });
     repaint_ctx.request_repaint();
+}
+
+fn legacy_green_mask(image: &RgbaImage, settings: &GreenSettings) -> Vec<bool> {
+    image
+        .as_raw()
+        .par_chunks_exact(4)
+        .map(|pixel| {
+            let r = pixel[0] as f32;
+            let g = pixel[1] as f32;
+            let b = pixel[2] as f32;
+            let green_excess = g - r.max(b);
+            let green_ratio = g / (r + g + b + 1.0);
+            green_excess >= settings.green_excess_threshold
+                && green_ratio >= settings.green_ratio_threshold
+        })
+        .collect()
+}
+
+fn plant_index_mask(image: &RgbaImage, settings: &GreenSettings) -> Vec<bool> {
+    image
+        .as_raw()
+        .par_chunks_exact(4)
+        .map(|pixel| {
+            let r = pixel[0] as f32;
+            let g = pixel[1] as f32;
+            let b = pixel[2] as f32;
+            let rg_mean = (r + g) * 0.5;
+            let blue_deficit = rg_mean - b;
+            let plant_index = (r + g - 2.0 * b) / (r + g + 2.0 * b + 1.0);
+            let green_red_ratio = g / (r + 1.0);
+
+            blue_deficit >= settings.blue_deficit_threshold
+                && plant_index >= settings.plant_index_threshold
+                && green_red_ratio >= settings.min_green_red_ratio
+                && rg_mean >= settings.min_rg_brightness
+        })
+        .collect()
+}
+
+fn parse_class_ids(value: &str) -> Result<Vec<usize>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let cleaned = trimmed
+        .replace('[', "")
+        .replace(']', "")
+        .replace('(', "")
+        .replace(')', "");
+    let mut ids = Vec::new();
+    for item in cleaned.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let id = item
+            .parse::<usize>()
+            .with_context(|| format!("invalid YOLO class ID '{item}'"))?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn mask_to_rgba(mask: &[bool], width: usize, height: usize) -> RgbaImage {
+    let mut image = RgbaImage::new(width as u32, height as u32);
+    image
+        .as_mut()
+        .par_chunks_exact_mut(4)
+        .zip(mask.par_iter())
+        .for_each(|(pixel, &selected)| {
+            if selected {
+                pixel.copy_from_slice(&[40, 255, 110, 255]);
+            } else {
+                pixel.copy_from_slice(&[0, 0, 0, 255]);
+            }
+        });
+    image
 }
 
 fn keep_components(
