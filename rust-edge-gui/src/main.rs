@@ -20,7 +20,7 @@ use yolo::{
     YoloRuntimeSettings, YoloWorker,
 };
 
-const APP_TITLE: &str = "Rust Edge GUI v0.7.1 — Live Sequences + Persistent UI";
+const APP_TITLE: &str = "Rust Edge GUI v0.7.2 — Robust Live Sequences";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -614,7 +614,11 @@ struct GreenViewerApp {
     capture_save_processed: bool,
     capture_url: Option<String>,
     capture_session: Option<CaptureSession>,
+    // Source acquisition and image processing are intentionally decoupled so a
+    // slow YOLO/temporal pass cannot stretch a 2-minute recording interval to 12 minutes.
     pending_capture: Option<PendingCapture>,
+    processing_capture: Option<PendingCapture>,
+    deferred_sequence_frame: Option<PathBuf>,
     next_capture_due: Option<Instant>,
 }
 
@@ -786,6 +790,8 @@ impl GreenViewerApp {
             capture_url: None,
             capture_session: None,
             pending_capture: None,
+            processing_capture: None,
+            deferred_sequence_frame: None,
             next_capture_due: None,
         };
 
@@ -810,6 +816,35 @@ impl GreenViewerApp {
     }
 
     fn queue_source(&mut self, request: SourceRequest) {
+        if let SourceRequest::SequenceFrame(path) = &request {
+            if !path.is_file() {
+                if let Some(sequence) = self.active_sequence.as_mut() {
+                    sequence.frames.retain(|frame| frame.path.is_file());
+                    sequence.selected = sequence.selected.min(sequence.frames.len().saturating_sub(1));
+                    if !sequence.frames.is_empty() {
+                        let _ = write_sequence_manifest(sequence);
+                    }
+                }
+                self.source_loading = false;
+                self.error = Some(format!(
+                    "Sequence frame disappeared before it could be opened: {}. The sequence was pruned to existing files.",
+                    path.display()
+                ));
+                return;
+            }
+        }
+        if let SourceRequest::SequenceFrame(path) = &request {
+            if self.continuous_capture && self.pending_capture.is_some() {
+                self.deferred_sequence_frame = Some(path.clone());
+                self.status = "A capture is being fetched/saved; sequence navigation is queued until the raw frame is committed.".to_owned();
+                return;
+            }
+            if let Some(sequence) = self.active_sequence.as_mut() {
+                if let Some(index) = sequence.frames.iter().position(|frame| &frame.path == path) {
+                    sequence.selected = index;
+                }
+            }
+        }
         let is_capture = matches!(&request, SourceRequest::CaptureUrl(_));
         if matches!(&request, SourceRequest::SequenceFrame(_) | SourceRequest::CaptureUrl(_)) {
             self.current_final_mask = None;
@@ -826,6 +861,10 @@ impl GreenViewerApp {
         }
         if !is_capture {
             self.pending_capture = None;
+            // Loading another image invalidates the current capture-processing job.
+            // The original capture is already safely on disk; processed output is best-effort
+            // when interactive analysis competes with continuous recording.
+            self.processing_capture = None;
         }
 
         self.next_source_id = self.next_source_id.wrapping_add(1).max(1);
@@ -864,15 +903,39 @@ impl GreenViewerApp {
                     if is_pending_capture && self.continuous_capture {
                         self.capture_url = Some(image.label.clone());
                     }
-                    self.install_loaded_image(image, remember_source, preserve_view, ctx);
+                    self.install_loaded_image(
+                        image,
+                        remember_source,
+                        preserve_view,
+                        ctx,
+                        !is_pending_capture,
+                    );
                     if is_pending_capture {
-                        self.save_pending_capture_original();
+                        // Commit the raw frame first, then schedule processing. This
+                        // guarantees that tracking/temporal filtering sees a sequence
+                        // entry only after its file exists and uses the correct frame index.
+                        let committed_index = self.save_pending_capture_original();
+                        if self.capture_save_original && committed_index.is_none() {
+                            // Original saving was requested but failed. We may still save
+                            // a processed-only fallback if processing succeeds.
+                            self.status = "Capture loaded, but original save failed; processing fallback…".to_owned();
+                        }
+                        self.schedule_processing();
+                        if let Some(frame_index) = committed_index {
+                            self.active_processing_sequence_frame = Some(frame_index);
+                        }
                         if self.processing {
                             if let Some(pending) = self.pending_capture.as_mut() {
                                 pending.processing_job_id = Some(self.active_job_id);
                             }
+                            // Raw acquisition is complete. Move metadata to a separate
+                            // processing slot so the next timed capture is not blocked by YOLO.
+                            self.processing_capture = self.pending_capture.take();
                         } else {
                             self.pending_capture = None;
+                        }
+                        if let Some(path) = self.deferred_sequence_frame.take() {
+                            self.queue_source(SourceRequest::SequenceFrame(path));
                         }
                     }
                 }
@@ -888,6 +951,9 @@ impl GreenViewerApp {
                     }
                     self.error = Some(error);
                     self.status = "Load failed".to_owned();
+                    if let Some(path) = self.deferred_sequence_frame.take() {
+                        self.queue_source(SourceRequest::SequenceFrame(path));
+                    }
                 }
                 _ => {}
             }
@@ -900,6 +966,7 @@ impl GreenViewerApp {
         remember_source: bool,
         preserve_view: bool,
         ctx: &egui::Context,
+        schedule_processing: bool,
     ) {
         let rgba = Arc::new(image.rgba);
         let gray = Arc::new(image.gray);
@@ -920,7 +987,9 @@ impl GreenViewerApp {
         if remember_source {
             self.remember_source(image.label);
         }
-        self.schedule_processing();
+        if schedule_processing {
+            self.schedule_processing();
+        }
     }
 
     fn remember_source(&mut self, source: String) {
@@ -1067,12 +1136,15 @@ impl GreenViewerApp {
             self.error = Some("Add at least two sequence folders to glue.".to_owned());
             return;
         }
-        let Some(parent) = rfd::FileDialog::new()
-            .set_title("Choose destination for glued sequence")
-            .pick_folder()
-        else {
+        let parent = PathBuf::from(self.capture_base_dir_input.trim());
+        if parent.as_os_str().is_empty() {
+            self.error = Some("Set a capture/save directory before gluing sequences.".to_owned());
             return;
-        };
+        }
+        if let Err(error) = std::fs::create_dir_all(&parent) {
+            self.error = Some(format!("Failed to create glue output directory {}: {error}", parent.display()));
+            return;
+        }
 
         let stamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
         let root = parent.join(format!("glued_sequence_{stamp}"));
@@ -1083,51 +1155,70 @@ impl GreenViewerApp {
         }
 
         let inputs = self.sequence_glue_inputs.clone();
-        let result = (|| -> Result<usize> {
-            let mut manifest_frames = Vec::new();
-            let mut output_index = 1usize;
+        let result = (|| -> Result<(usize, Option<SystemTime>, Option<SystemTime>)> {
+            let mut all_frames = Vec::<SequenceFrame>::new();
             for input in inputs {
                 let sequence = load_image_sequence(Path::new(&input))
                     .with_context(|| format!("cannot load glue input {input}"))?;
-                for frame in sequence.frames {
-                    let extension = frame
-                        .path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .unwrap_or("png")
-                        .to_ascii_lowercase();
-                    let file_name = format!("frame_{output_index:08}.{extension}");
-                    let destination = original_dir.join(&file_name);
-                    std::fs::copy(&frame.path, &destination).with_context(|| {
-                        format!("cannot copy {} to {}", frame.path.display(), destination.display())
-                    })?;
-                    let timestamp_ms = frame
-                        .timestamp
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                        .min(u64::MAX as u128) as u64;
-                    manifest_frames.push(SequenceManifestFrame {
-                        path: format!("original/{file_name}"),
-                        timestamp_ms,
-                    });
-                    output_index = output_index.saturating_add(1);
-                }
+                all_frames.extend(sequence.frames.into_iter().filter(|frame| frame.path.is_file()));
             }
-            let frame_count = manifest_frames.len();
-            let manifest = SequenceManifest { version: 1, frames: manifest_frames };
-            let json = serde_json::to_vec_pretty(&manifest)?;
-            std::fs::write(root.join("sequence.json"), json)
-                .with_context(|| format!("cannot write {}/sequence.json", root.display()))?;
-            Ok(frame_count)
+            all_frames.sort_by(|a, b| {
+                a.timestamp
+                    .cmp(&b.timestamp)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+            all_frames.dedup_by(|a, b| a.path == b.path);
+            if all_frames.is_empty() {
+                return Err(anyhow!("the selected sequences contain no existing image frames"));
+            }
+
+            let first_time = all_frames.first().map(|frame| frame.timestamp);
+            let last_time = all_frames.last().map(|frame| frame.timestamp);
+            let mut output_frames = Vec::with_capacity(all_frames.len());
+            for (index, frame) in all_frames.into_iter().enumerate() {
+                let extension = frame
+                    .path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("png")
+                    .to_ascii_lowercase();
+                let file_name = format!("frame_{:08}.{extension}", index + 1);
+                let destination = original_dir.join(&file_name);
+                std::fs::copy(&frame.path, &destination).with_context(|| {
+                    format!("cannot copy {} to {}", frame.path.display(), destination.display())
+                })?;
+                output_frames.push(SequenceFrame {
+                    path: destination,
+                    timestamp: frame.timestamp,
+                });
+            }
+
+            let sequence = ImageSequence {
+                root: root.clone(),
+                frames: output_frames,
+                selected: 0,
+            };
+            write_sequence_manifest(&sequence)?;
+            Ok((sequence.frames.len(), first_time, last_time))
         })();
 
         match result {
-            Ok(frame_count) => {
+            Ok((frame_count, first_time, last_time)) => {
                 self.error = None;
                 self.open_sequence(root.clone());
                 if self.active_sequence.as_ref().is_some_and(|sequence| sequence.root == root) {
-                    self.status = format!("Glued {frame_count} frame(s) into {} and opened it", root.display());
+                    let span = match (first_time, last_time) {
+                        (Some(first), Some(last)) => format!(
+                            "{} → {}",
+                            format_absolute_time(first),
+                            format_absolute_time(last)
+                        ),
+                        _ => "unknown time span".to_owned(),
+                    };
+                    self.status = format!(
+                        "Glued {frame_count} frame(s) chronologically ({span}) into {} and opened it",
+                        root.display()
+                    );
                 }
             }
             Err(error) => {
@@ -1205,6 +1296,8 @@ impl GreenViewerApp {
         self.shape_tracks.clear();
         self.capture_url = Some(url);
         self.pending_capture = None;
+        self.processing_capture = None;
+        self.deferred_sequence_frame = None;
         self.next_capture_due = Some(Instant::now());
         self.continuous_capture = true;
         self.original_view.reset_fit();
@@ -1227,6 +1320,9 @@ impl GreenViewerApp {
             .as_ref()
             .map(|session| session.root.display().to_string());
         self.capture_url = None;
+        self.pending_capture = None;
+        self.processing_capture = None;
+        self.deferred_sequence_frame = None;
         self.save_preferences();
         self.status = match location {
             Some(location) => format!("Continuous capture stopped. Saved in {location}"),
@@ -1244,7 +1340,6 @@ impl GreenViewerApp {
         if now >= due
             && self.pending_capture.is_none()
             && !self.source_loading
-            && !self.processing
         {
             let Some(url) = self.capture_url.clone() else {
                 self.stop_continuous_capture();
@@ -1252,7 +1347,7 @@ impl GreenViewerApp {
             };
             let captured_at = SystemTime::now();
             let timestamp: DateTime<Local> = captured_at.into();
-            let (file_name, frame_path, session_root) = {
+            let (file_name, session_root) = {
                 let Some(session) = self.capture_session.as_mut() else {
                     self.stop_continuous_capture();
                     return;
@@ -1263,12 +1358,7 @@ impl GreenViewerApp {
                     timestamp.format("%Y%m%d_%H%M%S_%3f")
                 );
                 session.next_frame_index = session.next_frame_index.saturating_add(1);
-                let frame_path = if self.capture_save_original {
-                    session.original_dir.join(&file_name)
-                } else {
-                    session.processed_dir.join(&file_name)
-                };
-                (file_name, frame_path, session.root.clone())
+                (file_name, session.root.clone())
             };
 
             if self
@@ -1282,22 +1372,19 @@ impl GreenViewerApp {
                     selected: 0,
                 });
             }
-            let sequence_frame_index = self.active_sequence.as_mut().map(|sequence| {
-                sequence.frames.push(SequenceFrame { path: frame_path, timestamp: captured_at });
-                sequence.selected = sequence.frames.len().saturating_sub(1);
-                sequence.selected
-            });
 
+            // Do not expose a frame to the live sequence until its backing file exists.
+            // Previously the frame was appended optimistically here, so tracking/playback
+            // could try to open a path that had not been written yet.
             self.queue_source(SourceRequest::CaptureUrl(url));
             self.pending_capture = Some(PendingCapture {
                 source_id: self.active_source_id,
                 processing_job_id: None,
                 file_name,
                 captured_at,
-                sequence_frame_index,
+                sequence_frame_index: None,
             });
             if !self.source_loading {
-                self.remove_pending_capture_sequence_frame();
                 self.pending_capture = None;
             }
             self.next_capture_due = Some(
@@ -1315,64 +1402,149 @@ impl GreenViewerApp {
     }
 
     fn remove_pending_capture_sequence_frame(&mut self) {
-        let Some(frame_index) = self.pending_capture.as_ref().and_then(|pending| pending.sequence_frame_index) else {
+        let Some(frame_index) = self
+            .pending_capture
+            .as_ref()
+            .and_then(|pending| pending.sequence_frame_index)
+        else {
             return;
         };
-        let Some(sequence) = self.active_sequence.as_mut() else {
-            return;
-        };
-        if frame_index < sequence.frames.len() {
+        let manifest_result = {
+            let Some(sequence) = self.active_sequence.as_mut() else {
+                return;
+            };
+            if frame_index >= sequence.frames.len() {
+                return;
+            }
             sequence.frames.remove(frame_index);
             sequence.selected = sequence.selected.min(sequence.frames.len().saturating_sub(1));
-        }
-    }
-
-    fn save_pending_capture_original(&mut self) {
-        if !self.capture_save_original {
-            return;
-        }
-        let (Some(session), Some(pending), Some(image)) = (
-            self.capture_session.as_ref(),
-            self.pending_capture.as_ref(),
-            self.original_rgba.as_ref(),
-        ) else {
-            return;
+            write_sequence_manifest(sequence)
         };
-        let path = session.original_dir.join(&pending.file_name);
-        if let Err(error) = DynamicImage::ImageRgba8((**image).clone()).save(&path) {
-            self.error = Some(format!("Failed to save capture {}: {error}", path.display()));
+        if let Err(error) = manifest_result {
+            self.error = Some(format!("Failed to update sequence manifest: {error:#}"));
         }
     }
 
-    fn save_pending_capture_processed(&mut self, completed_job_id: u64) {
+    fn append_capture_to_sequence(
+        &mut self,
+        path: PathBuf,
+        captured_at: SystemTime,
+    ) -> Option<usize> {
+        if !path.is_file() {
+            self.error = Some(format!(
+                "Capture was not added to sequence because {} does not exist",
+                path.display()
+            ));
+            return None;
+        }
+
+        let session_root = self.capture_session.as_ref()?.root.clone();
+        if self
+            .active_sequence
+            .as_ref()
+            .is_none_or(|sequence| sequence.root != session_root)
+        {
+            self.active_sequence = Some(ImageSequence {
+                root: session_root,
+                frames: Vec::new(),
+                selected: 0,
+            });
+        }
+
+        let committed_path = path.clone();
+        let (index, manifest_result) = {
+            let sequence = self.active_sequence.as_mut()?;
+            if !sequence.frames.iter().any(|frame| frame.path == committed_path) {
+                sequence.frames.push(SequenceFrame {
+                    path,
+                    timestamp: captured_at,
+                });
+            }
+            sequence.frames.sort_by(|a, b| {
+                a.timestamp
+                    .cmp(&b.timestamp)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+            let index = sequence
+                .frames
+                .iter()
+                .position(|frame| frame.path == committed_path)
+                .unwrap_or_else(|| sequence.frames.len().saturating_sub(1));
+            sequence.selected = index;
+            (index, write_sequence_manifest(sequence))
+        };
+
+        if let Err(error) = manifest_result {
+            self.error = Some(format!("Failed to update sequence manifest: {error:#}"));
+        }
+        Some(index)
+    }
+
+    fn save_pending_capture_original(&mut self) -> Option<usize> {
+        if !self.capture_save_original {
+            return None;
+        }
+        let (path, captured_at) = {
+            let session = self.capture_session.as_ref()?;
+            let pending = self.pending_capture.as_ref()?;
+            (session.original_dir.join(&pending.file_name), pending.captured_at)
+        };
+        let image = self.original_rgba.as_ref()?.as_ref().clone();
+        if let Err(error) = DynamicImage::ImageRgba8(image).save(&path) {
+            self.error = Some(format!("Failed to save capture {}: {error}", path.display()));
+            return None;
+        }
+        let index = self.append_capture_to_sequence(path, captured_at);
+        if let (Some(index), Some(pending)) = (index, self.pending_capture.as_mut()) {
+            pending.sequence_frame_index = Some(index);
+        }
+        index
+    }
+
+    fn save_pending_capture_processed(
+        &mut self,
+        completed_job_id: u64,
+        image: &RgbaImage,
+    ) -> Option<usize> {
         let should_finish = self
-            .pending_capture
+            .processing_capture
             .as_ref()
             .and_then(|pending| pending.processing_job_id)
             .is_some_and(|id| id == completed_job_id);
         if !should_finish {
-            return;
+            return None;
         }
 
+        let mut committed_index = self
+            .processing_capture
+            .as_ref()
+            .and_then(|pending| pending.sequence_frame_index);
         if self.capture_save_processed {
-            if let (Some(session), Some(pending), Some(image)) = (
-                self.capture_session.as_ref(),
-                self.pending_capture.as_ref(),
-                self.processed_rgba.as_ref(),
-            ) {
-                let path = session.processed_dir.join(&pending.file_name);
+            let save_target = self.capture_session.as_ref().and_then(|session| {
+                self.processing_capture.as_ref().map(|pending| {
+                    (
+                        session.processed_dir.join(&pending.file_name),
+                        pending.captured_at,
+                    )
+                })
+            });
+            if let Some((path, captured_at)) = save_target {
                 if let Err(error) = DynamicImage::ImageRgba8(image.clone()).save(&path) {
                     self.error = Some(format!(
                         "Failed to save processed capture {}: {error}",
                         path.display()
                     ));
                 } else {
-                    let absolute = format_absolute_time(pending.captured_at);
+                    if committed_index.is_none() {
+                        committed_index = self.append_capture_to_sequence(path.clone(), captured_at);
+                    }
+                    let absolute = format_absolute_time(captured_at);
                     self.status = format!("Captured {} ({absolute})", path.display());
                 }
             }
         }
-        self.pending_capture = None;
+        self.processing_capture = None;
+        committed_index
     }
 
     fn schedule_processing(&mut self) {
@@ -1525,15 +1697,12 @@ impl GreenViewerApp {
                         self.processing = false;
                         self.progress_stage = "YOLO failed".to_owned();
                         if self
-                            .pending_capture
+                            .processing_capture
                             .as_ref()
                             .and_then(|pending| pending.processing_job_id)
                             .is_some_and(|job_id| job_id == id)
                         {
-                            if !self.capture_save_original {
-                                self.remove_pending_capture_sequence_frame();
-                            }
-                            self.pending_capture = None;
+                            self.processing_capture = None;
                         }
                         self.error = Some(error);
                     }
@@ -1563,7 +1732,13 @@ impl GreenViewerApp {
 
                     let frame_mask = Arc::new(result.mask);
                     self.current_final_mask = Some(Arc::clone(&frame_mask));
-                    if let Some(frame_index) = self.active_processing_sequence_frame {
+                    self.error = None;
+
+                    self.processed_rgba = Some(result.processed.clone());
+                    let committed_capture_index =
+                        self.save_pending_capture_processed(id, &result.processed);
+                    let frame_index = committed_capture_index.or(self.active_processing_sequence_frame);
+                    if let Some(frame_index) = frame_index {
                         self.cache_sequence_mask(
                             frame_index,
                             result.width,
@@ -1578,7 +1753,6 @@ impl GreenViewerApp {
                         );
                     }
 
-                    self.processed_rgba = Some(result.processed.clone());
                     let color_image = rgba_to_color_image(&result.processed);
                     if let Some(texture) = self.processed_texture.as_mut() {
                         texture.set(color_image, egui::TextureOptions::LINEAR);
@@ -1593,22 +1767,17 @@ impl GreenViewerApp {
                         "Detected {} mask component(s), {} plant px, {} boundary px",
                         self.shape_count, self.green_pixels, self.boundary_pixels
                     );
-                    self.error = None;
-                    self.save_pending_capture_processed(id);
                 }
                 ProcessingMessage::Failed { id, error } if id == self.active_job_id => {
                     self.processing = false;
                     self.progress_stage = "Failed".to_owned();
                     if self
-                        .pending_capture
+                        .processing_capture
                         .as_ref()
                         .and_then(|pending| pending.processing_job_id)
                         .is_some_and(|job_id| job_id == id)
                     {
-                        if !self.capture_save_original {
-                            self.remove_pending_capture_sequence_frame();
-                        }
-                        self.pending_capture = None;
+                        self.processing_capture = None;
                     }
                     self.error = Some(error);
                 }
@@ -2019,7 +2188,7 @@ impl GreenViewerApp {
         }
 
         ui.collapsing("Glue sequences", |ui| {
-            ui.small("Sequences are concatenated in the order shown. Frames are copied into a new sequence and original timestamps are preserved in sequence.json.");
+            ui.small("Add two or more sequence folders. Glue order is deduced automatically from every frame timestamp (oldest → newest); list order does not matter. Output is created inside the Save directory below.");
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Add active").clicked() {
                     if let Some(root) = self.active_sequence.as_ref().map(|sequence| sequence.root.clone()) {
@@ -2027,7 +2196,10 @@ impl GreenViewerApp {
                     }
                 }
                 if ui.button("Add folder…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().set_title("Add sequence to glue list").pick_folder() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Add sequence to glue list")
+                        .pick_folder()
+                    {
                         self.add_sequence_glue_input(path);
                     }
                 }
@@ -2037,32 +2209,23 @@ impl GreenViewerApp {
                 }
             });
             let mut remove = None;
-            let mut move_item: Option<(usize, isize)> = None;
             for (index, entry) in self.sequence_glue_inputs.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
-                        move_item = Some((index, -1));
-                    }
-                    if ui.add_enabled(index + 1 < self.sequence_glue_inputs.len(), egui::Button::new("↓")).clicked() {
-                        move_item = Some((index, 1));
-                    }
                     ui.monospace(format!("{:>2}. {}", index + 1, entry));
                     if ui.small_button("×").clicked() {
                         remove = Some(index);
                     }
                 });
             }
-            if let Some((index, delta)) = move_item {
-                let other = (index as isize + delta) as usize;
-                self.sequence_glue_inputs.swap(index, other);
-                self.save_preferences();
-            }
             if let Some(index) = remove {
                 self.sequence_glue_inputs.remove(index);
                 self.save_preferences();
             }
             if ui
-                .add_enabled(self.sequence_glue_inputs.len() >= 2, egui::Button::new("Glue into new sequence…"))
+                .add_enabled(
+                    self.sequence_glue_inputs.len() >= 2,
+                    egui::Button::new("Glue chronologically into new sequence…"),
+                )
                 .clicked()
             {
                 self.glue_sequences();
@@ -2119,6 +2282,7 @@ impl GreenViewerApp {
         if let Some(session) = self.capture_session.as_ref() {
             ui.small(format!("Session: {}", session.root.display()));
         }
+        ui.small("Capture acquisition is independent from mask processing: raw originals keep the requested interval even if YOLO/temporal processing is slower. If only Processed saving is enabled, frames can be skipped when processing cannot keep up.");
 
         ui.separator();
         ui.collapsing("Image windows", |ui| {
@@ -2909,9 +3073,15 @@ impl eframe::App for GreenViewerApp {
             .default_size(self.controls_window_size)
             .current_pos(self.controls_window_pos)
             .min_size(egui::vec2(330.0, 320.0))
-            .resizable(true)
+            .resizable([true, true])
+            .hscroll(true)
             .vscroll(true)
-            .show(&ctx, |ui| self.controls(ui))
+            .show(&ctx, |ui| {
+                // Keep a stable content width so shrinking the floating window exposes
+                // a horizontal scrollbar instead of collapsing controls into oblivion.
+                ui.set_min_width(760.0);
+                self.controls(ui)
+            })
         {
             self.controls_window_pos = response.response.rect.min;
             self.controls_window_size = response.response.rect.size();
@@ -2931,7 +3101,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.7.1")
+        .user_agent("rust-edge-gui/0.7.2")
         .build()
         .expect("failed to build HTTP client");
 
@@ -3760,6 +3930,50 @@ fn is_supported_image_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn write_sequence_manifest(sequence: &ImageSequence) -> Result<()> {
+    std::fs::create_dir_all(&sequence.root)
+        .with_context(|| format!("cannot create {}", sequence.root.display()))?;
+    let mut manifest_frames = Vec::with_capacity(sequence.frames.len());
+    for frame in &sequence.frames {
+        if !frame.path.is_file() {
+            continue;
+        }
+        let relative = frame
+            .path
+            .strip_prefix(&sequence.root)
+            .unwrap_or(frame.path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let timestamp_ms = frame
+            .timestamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        manifest_frames.push(SequenceManifestFrame {
+            path: relative,
+            timestamp_ms,
+        });
+    }
+    manifest_frames.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let manifest = SequenceManifest {
+        version: 1,
+        frames: manifest_frames,
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    let target = sequence.root.join("sequence.json");
+    let temporary = sequence.root.join("sequence.json.tmp");
+    std::fs::write(&temporary, bytes)
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    std::fs::rename(&temporary, &target)
+        .with_context(|| format!("cannot replace {}", target.display()))?;
+    Ok(())
+}
+
 fn load_image_sequence(root: &Path) -> Result<ImageSequence> {
     if !root.exists() {
         return Err(anyhow!("{} does not exist", root.display()));
@@ -3789,6 +4003,11 @@ fn load_image_sequence(root: &Path) -> Result<ImageSequence> {
             }
         }
         if !frames.is_empty() {
+            frames.sort_by(|a, b| {
+                a.timestamp
+                    .cmp(&b.timestamp)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
             return Ok(ImageSequence { root: root.to_path_buf(), frames, selected: 0 });
         }
     }
@@ -3820,7 +4039,11 @@ fn load_image_sequence(root: &Path) -> Result<ImageSequence> {
         }
     }
 
-    frames.sort_by(|a, b| a.path.cmp(&b.path));
+    frames.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     if frames.is_empty() {
         return Err(anyhow!(
             "no supported images found in {}",

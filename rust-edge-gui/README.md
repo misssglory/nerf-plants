@@ -1,12 +1,23 @@
-# rust-edge-gui 0.7.1
+# rust-edge-gui 0.7.2
 
 Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, native offline YOLO segmentation, per-window navigation, sequence playback, temporal false-positive filtering, and tracked mask-area plots.
+
+
+## What changed in 0.7.2
+
+- **No more live ghost frames** — a recording frame enters the active sequence only after the backing file has been written successfully. `sequence.json` is updated atomically at the same point.
+- **Missing-frame self-healing** — if an older/stale timeline entry points to a file that disappeared, navigation prunes it instead of sending a nonexistent path to the decoder.
+- **Correct live tracking index** — capture processing starts after the raw frame is committed, so tracking and symmetric temporal filtering are associated with the new frame rather than the previously selected frame.
+- **Capture timing is no longer tied to YOLO speed** — once a raw frame is written, the next timed acquisition is free to proceed even if the previous mask job is still running. This keeps original-frame recording close to the requested cadence while analysis continues independently.
+- **Resizable 2D-scrolling controls** — the floating Controls / sequence window can be resized in both axes and now has horizontal as well as vertical scrolling.
+- **Automatic chronological glue** — add sequence folders in any order; all frames are merged by timestamp from oldest to newest. The glued sequence is written under the configured **Save directory** and opened automatically.
+- **Timestamp-first sequence ordering** — sequence loading uses timestamp order with path only as a tie-breaker.
 
 
 ## What changed in 0.7.1
 
 - **Live recording stays a sequence** — continuous capture no longer clears `active_sequence`. The sequence/timeline and temporal controls remain visible while frames arrive, and the live timeline grows frame-by-frame.
-- **Sequence glue UI** — add multiple sequence folders, reorder them with ↑/↓, and glue them into a new sequence. Frames are copied into `original/`; `sequence.json` preserves the original timestamps.
+- **Sequence glue UI** — add multiple sequence folders and glue them into a new sequence. In 0.7.2 the input-list order is ignored and frames are sorted automatically by timestamp. Frames are copied into `original/`; `sequence.json` preserves the original timestamps.
 - **Symmetric temporal filter** — temporal persistence now uses both previous and future cached masks. For a configured window `n`, support radius is `floor(n/2) - 1` frames backward and the same number forward.
 - **Persistent GUI state** — detector parameters, colors, YOLO controls, temporal/tracking/playback controls, capture options, histories, glue list, image-window pan/zoom/open state, floating-window positions/sizes, and egui scroll/collapse state are restored after relaunch.
 - **Native window persistence** — eframe persistence is enabled with a stable `rust-edge-gui` app ID, so the main OS window position/size is restored too.

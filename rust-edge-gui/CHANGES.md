@@ -1,5 +1,18 @@
 # Changes
 
+## 0.7.2
+
+- Fixed live-recording ghost frames: a frame is added to the active sequence only after its backing image has been saved successfully.
+- Capture sessions now update `sequence.json` atomically after committed frames, preventing timeline entries that point to files which do not exist.
+- Sequence navigation validates paths and prunes stale/missing frames instead of attempting to decode them.
+- Capture processing is scheduled after original-file commit so temporal filtering/tracking use the correct live-sequence frame index.
+- Decoupled timed image acquisition from mask processing: slow YOLO/temporal jobs no longer block the next raw capture interval; interactive sequence navigation is deferred only while a raw capture is actually being fetched/saved.
+- Controls window now supports both horizontal and vertical scrolling and remains freely resizable; controls keep a stable minimum content width so horizontal scrolling is actually usable.
+- Sequence gluing is now chronological automatically: all frames from all selected sequences are merged by timestamp (oldest to newest), regardless of the order of the input list.
+- Glue output is created directly under the configured Save directory, removing the extra destination dialog that could appear to do nothing behind floating windows.
+- Sequence loading now sorts frames by timestamp (with path as a deterministic tie-breaker).
+- Bumped package version to 0.7.2.
+
 ## 0.7.1
 
 - Fixed continuous capture clearing `active_sequence`; sequence/timeline and temporal controls now stay visible while recording.
