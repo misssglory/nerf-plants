@@ -1,6 +1,28 @@
-# rust-edge-gui 0.8.1
+# rust-edge-gui 0.8.2
 
 Rust/egui plant-mask viewer and timeseries dashboard for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, native offline YOLO segmentation, temporal filtering, automatic plant/leaf tracking, multiple resizable plots, and external Home Assistant sensor timeseries.
+
+## What changed in 0.8.2
+
+- Status now carries a formatted local timestamp and includes a persistent event/error history (up to 250 entries).
+- Shape pivot colors and their `shape:<group_id>` plot-series colors now come from exactly the same key/palette mapping.
+- Added root `config.toml` for Telegram bot notification credentials and capture retry cooldown. Set `RUST_EDGE_GUI_CONFIG` to use a config elsewhere.
+- Any image-load failure can send a Telegram alert. Scheduled continuous-capture failures retry after the configured cooldown only inside the current frame slot; when the next scheduled frame is due, the failed slot is abandoned so recording can continue.
+- Capture recovery after one or more retries sends a single Telegram recovery notification instead of spamming every retry attempt.
+
+### Telegram configuration
+
+Edit `config.toml`:
+
+```toml
+[telegram]
+enabled = true
+bot_token = "123456:YOUR_BOT_TOKEN"
+chat_id = "YOUR_CHAT_ID"
+retry_cooldown_seconds = 10.0
+```
+
+Do not commit a populated credentials file to a public repository. Telegram settings are read at startup and are not copied into GUI persistence/state JSON.
 
 ## What changed in 0.8.1
 

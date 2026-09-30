@@ -1,5 +1,15 @@
 # Changes
 
+## 0.8.2
+
+- Add formatted local timestamps to current Status and a persistent 250-entry status/error history.
+- Make processed-image pivot colors identical to the corresponding shape-area timeseries colors.
+- Add `config.toml` Telegram credentials/settings (`enabled`, `bot_token`, `chat_id`, `retry_cooldown_seconds`).
+- Send Telegram notification when image loading fails.
+- For continuous capture, retry a failed scheduled frame after a cooldown only until the next scheduled frame is due; never let one bad slot freeze subsequent capture.
+- Send one recovery notification when a retried capture succeeds.
+- Bump package/user-agent version to 0.8.2.
+
 ## 0.8.1
 
 - Fix Home Assistant compilation by enabling reqwest's `json` feature, making `blocking::Response::json()` available.

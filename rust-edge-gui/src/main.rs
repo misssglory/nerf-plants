@@ -1,6 +1,7 @@
 mod viewer;
 mod yolo;
 mod home_assistant;
+mod telegram;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -21,12 +22,14 @@ use yolo::{
     YoloRuntimeSettings, YoloWorker,
 };
 use home_assistant::{HaMessage, HaRequest, HaRequestKind, HaSeriesRequest, HaWorker};
+use telegram::{load_telegram_config, TelegramConfig, TelegramNotifier};
 
-const APP_TITLE: &str = "Rust Edge GUI v0.8.1 — Timeseries Dashboard & Frame Management";
+const APP_TITLE: &str = "Rust Edge GUI v0.8.2 — Capture Reliability & Telegram Alerts";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
 const MAX_EXTERNAL_SERIES_POINTS: usize = 50_000;
+const MAX_STATUS_HISTORY: usize = 250;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetectionMode {
@@ -493,12 +496,21 @@ struct PlotSeriesData {
     points: Vec<PlotPoint>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedStatusEvent {
+    timestamp_ms: u64,
+    text: String,
+    is_error: bool,
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
     version: u32,
     #[serde(default)]
     source_history: Vec<String>,
+    #[serde(default)]
+    status_history: Vec<PersistedStatusEvent>,
     #[serde(default)]
     sequence_history: Vec<String>,
     #[serde(default)]
@@ -676,6 +688,13 @@ struct ShapeGroupSeries {
     centroids: BTreeMap<usize, (u32, u32)>,
 }
 
+#[derive(Clone, Debug)]
+struct StatusEvent {
+    time: SystemTime,
+    text: String,
+    is_error: bool,
+}
+
 struct CaptureSession {
     root: PathBuf,
     original_dir: PathBuf,
@@ -689,6 +708,8 @@ struct PendingCapture {
     file_name: String,
     captured_at: SystemTime,
     sequence_frame_index: Option<usize>,
+    retry_count: usize,
+    failure_notified: bool,
 }
 
 struct GreenViewerApp {
@@ -746,6 +767,9 @@ struct GreenViewerApp {
     yolo_summary: String,
     status: String,
     error: Option<String>,
+    status_changed_at: SystemTime,
+    status_history: VecDeque<StatusEvent>,
+    last_status_signature: String,
 
     original_view: viewer::ImageViewState,
     processed_view: viewer::ImageViewState,
@@ -808,6 +832,11 @@ struct GreenViewerApp {
     ha_request_pending: bool,
     next_ha_poll: Option<Instant>,
     ha_status: String,
+
+    telegram_config: TelegramConfig,
+    telegram_notifier: TelegramNotifier,
+    telegram_config_status: String,
+    capture_retry_due: Option<Instant>,
 
     controls_window_pos: egui::Pos2,
     controls_window_size: egui::Vec2,
@@ -972,6 +1001,32 @@ impl GreenViewerApp {
             24.0
         };
 
+        let (telegram_config, telegram_config_status) = load_telegram_config();
+        let telegram_notifier = TelegramNotifier::spawn(&telegram_config);
+        let initial_status = "Open an image from disk or enter a camera IP/address.".to_owned();
+        let initial_status_time = SystemTime::now();
+        let mut loaded_status_history = persisted
+            .status_history
+            .iter()
+            .filter_map(|entry| {
+                UNIX_EPOCH
+                    .checked_add(Duration::from_millis(entry.timestamp_ms))
+                    .map(|time| StatusEvent {
+                        time,
+                        text: entry.text.clone(),
+                        is_error: entry.is_error,
+                    })
+            })
+            .collect::<VecDeque<_>>();
+        while loaded_status_history.len() >= MAX_STATUS_HISTORY {
+            loaded_status_history.pop_front();
+        }
+        loaded_status_history.push_back(StatusEvent {
+            time: initial_status_time,
+            text: initial_status.clone(),
+            is_error: false,
+        });
+
         let mut app = Self {
             original_rgba: None,
             original_gray: None,
@@ -1021,8 +1076,11 @@ impl GreenViewerApp {
             yolo_mask_pixels: 0,
             yolo_elapsed_ms: 0.0,
             yolo_summary: "No YOLO inference yet".to_owned(),
-            status: "Open an image from disk or enter a camera IP/address.".to_owned(),
+            status: initial_status.clone(),
             error: None,
+            status_changed_at: initial_status_time,
+            status_history: loaded_status_history,
+            last_status_signature: format!("status:{initial_status}"),
             original_view,
             processed_view,
             current_final_mask: None,
@@ -1070,6 +1128,10 @@ impl GreenViewerApp {
             ha_request_pending: false,
             next_ha_poll: None,
             ha_status: "Home Assistant idle".to_owned(),
+            telegram_config,
+            telegram_notifier,
+            telegram_config_status,
+            capture_retry_due: None,
             controls_window_pos: controls_window.pos(),
             controls_window_size: controls_window.size(),
             shape_plot_window_pos: shape_plot_window.pos(),
@@ -1122,6 +1184,47 @@ impl GreenViewerApp {
         app
     }
 
+    fn sync_status_history(&mut self) {
+        let (is_error, text) = match self.error.as_ref() {
+            Some(error) => (true, format!("{} — {error}", self.status)),
+            None => (false, self.status.clone()),
+        };
+        let signature = format!("{}:{text}", if is_error { "error" } else { "status" });
+        if signature == self.last_status_signature {
+            return;
+        }
+        let now = SystemTime::now();
+        self.status_changed_at = now;
+        self.last_status_signature = signature;
+        self.status_history.push_back(StatusEvent { time: now, text, is_error });
+        while self.status_history.len() > MAX_STATUS_HISTORY {
+            self.status_history.pop_front();
+        }
+        self.preferences_dirty = true;
+        self.next_preferences_save = Instant::now() + Duration::from_secs(1);
+    }
+
+    fn notify_telegram(&self, text: impl Into<String>) {
+        self.telegram_notifier.send(text);
+    }
+
+    fn capture_retry_cooldown(&self) -> Duration {
+        Duration::from_secs_f32(self.telegram_config.retry_cooldown_seconds.clamp(0.1, 3600.0))
+    }
+
+    fn abandon_failed_capture_slot(&mut self, reason: &str) {
+        let retry_count = self.pending_capture.as_ref().map(|pending| pending.retry_count).unwrap_or(0);
+        self.pending_capture = None;
+        self.capture_retry_due = None;
+        self.source_loading = false;
+        let message = format!("Capture slot abandoned after {retry_count} retries: {reason}");
+        self.status = message.clone();
+        self.error = Some(message);
+        if let Some(path) = self.deferred_sequence_frame.take() {
+            self.queue_source(SourceRequest::SequenceFrame(path));
+        }
+    }
+
     fn queue_source(&mut self, request: SourceRequest) {
         if let SourceRequest::SequenceFrame(path) = &request {
             if !path.is_file() {
@@ -1133,10 +1236,16 @@ impl GreenViewerApp {
                     }
                 }
                 self.source_loading = false;
-                self.error = Some(format!(
+                let message = format!(
                     "Sequence frame disappeared before it could be opened: {}. The sequence was pruned to existing files.",
                     path.display()
+                );
+                self.notify_telegram(format!(
+                    "⚠️ rust-edge-gui image load failed at {}
+{message}",
+                    format_status_time(SystemTime::now())
                 ));
+                self.error = Some(message);
                 return;
             }
         }
@@ -1168,6 +1277,7 @@ impl GreenViewerApp {
         }
         if !is_capture {
             self.pending_capture = None;
+            self.capture_retry_due = None;
             // Loading another image invalidates the current capture-processing job.
             // The original capture is already safely on disk; processed output is best-effort
             // when interactive analysis competes with continuous recording.
@@ -1188,7 +1298,13 @@ impl GreenViewerApp {
             }
             Err(error) => {
                 self.source_loading = false;
-                self.error = Some(format!("Image loader stopped: {error}"));
+                let message = format!("Image loader stopped: {error}");
+                self.notify_telegram(format!(
+                    "⚠️ rust-edge-gui image loader failed at {}
+{message}",
+                    format_status_time(SystemTime::now())
+                ));
+                self.error = Some(message);
             }
         }
     }
@@ -1207,8 +1323,22 @@ impl GreenViewerApp {
                         .pending_capture
                         .as_ref()
                         .is_some_and(|pending| pending.source_id == id);
+                    let recovered_after_retries = self
+                        .pending_capture
+                        .as_ref()
+                        .filter(|pending| pending.source_id == id)
+                        .map(|pending| pending.retry_count)
+                        .unwrap_or(0);
                     if is_pending_capture && self.continuous_capture {
                         self.capture_url = Some(image.label.clone());
+                        self.capture_retry_due = None;
+                        if recovered_after_retries > 0 {
+                            self.notify_telegram(format!(
+                                "✅ rust-edge-gui capture recovered after {recovered_after_retries} retr{} at {}",
+                                if recovered_after_retries == 1 { "y" } else { "ies" },
+                                format_status_time(SystemTime::now())
+                            ));
+                        }
                     }
                     self.install_loaded_image(
                         image,
@@ -1248,18 +1378,68 @@ impl GreenViewerApp {
                 }
                 SourceMessage::Failed { id, error } if id == self.active_source_id => {
                     self.source_loading = false;
-                    if self
+                    let is_pending_capture = self
                         .pending_capture
                         .as_ref()
-                        .is_some_and(|pending| pending.source_id == id)
-                    {
-                        self.remove_pending_capture_sequence_frame();
-                        self.pending_capture = None;
-                    }
-                    self.error = Some(error);
-                    self.status = "Load failed".to_owned();
-                    if let Some(path) = self.deferred_sequence_frame.take() {
-                        self.queue_source(SourceRequest::SequenceFrame(path));
+                        .is_some_and(|pending| pending.source_id == id);
+
+                    if is_pending_capture && self.continuous_capture {
+                        let now = Instant::now();
+                        let cooldown = self.capture_retry_cooldown();
+                        let retry_at = now + cooldown;
+                        let next_frame_due = self.next_capture_due.unwrap_or(retry_at + Duration::from_secs(1));
+                        let can_retry = retry_at < next_frame_due;
+
+                        let should_notify = self
+                            .pending_capture
+                            .as_ref()
+                            .is_some_and(|pending| !pending.failure_notified);
+                        if should_notify {
+                            let file_name = self
+                                .pending_capture
+                                .as_ref()
+                                .map(|pending| pending.file_name.clone())
+                                .unwrap_or_else(|| "capture frame".to_owned());
+                            let retry_note = if can_retry {
+                                format!(
+                                    "Retrying every {:.1}s until the next scheduled frame.",
+                                    self.telegram_config.retry_cooldown_seconds
+                                )
+                            } else {
+                                "No retry fits before the next scheduled frame; this slot will be skipped.".to_owned()
+                            };
+                            self.notify_telegram(format!(
+                                "⚠️ rust-edge-gui failed to load {file_name} at {}
+{error}
+{retry_note}",
+                                format_status_time(SystemTime::now())
+                            ));
+                            if let Some(pending) = self.pending_capture.as_mut() {
+                                pending.failure_notified = true;
+                            }
+                        }
+
+                        self.error = Some(error.clone());
+                        if can_retry {
+                            self.capture_retry_due = Some(retry_at);
+                            self.status = format!(
+                                "Capture load failed; retry in {:.1}s (before next frame)",
+                                cooldown.as_secs_f32()
+                            );
+                        } else {
+                            self.abandon_failed_capture_slot(&error);
+                        }
+                    } else {
+                        self.notify_telegram(format!(
+                            "⚠️ rust-edge-gui image load failed at {}
+{error}",
+                            format_status_time(SystemTime::now())
+                        ));
+                        self.error = Some(error);
+                        self.status = "Load failed".to_owned();
+                        if let Some(path) = self.deferred_sequence_frame.take() {
+                            self.queue_source(SourceRequest::SequenceFrame(path));
+                        }
                     }
                 }
                 _ => {}
@@ -1317,8 +1497,22 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
-            version: 5,
+            version: 6,
             source_history: self.source_history.clone(),
+            status_history: self
+                .status_history
+                .iter()
+                .map(|entry| PersistedStatusEvent {
+                    timestamp_ms: entry
+                        .time
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    text: entry.text.clone(),
+                    is_error: entry.is_error,
+                })
+                .collect(),
             sequence_history: self.sequence_history.clone(),
             capture_base_dir: self.capture_base_dir_input.clone(),
             capture_interval_secs: self.capture_interval_secs,
@@ -1899,6 +2093,7 @@ impl GreenViewerApp {
         self.pending_capture = None;
         self.processing_capture = None;
         self.deferred_sequence_frame = None;
+        self.capture_retry_due = None;
         self.next_capture_due = Some(Instant::now());
         self.continuous_capture = true;
         self.sequence_playing = false;
@@ -1993,6 +2188,7 @@ impl GreenViewerApp {
         self.pending_capture = None;
         self.processing_capture = None;
         self.deferred_sequence_frame = None;
+        self.capture_retry_due = None;
         self.next_capture_due = Some(Instant::now());
         self.continuous_capture = true;
         self.original_view.reset_fit();
@@ -2010,6 +2206,7 @@ impl GreenViewerApp {
     fn stop_continuous_capture(&mut self) {
         self.continuous_capture = false;
         self.next_capture_due = None;
+        self.capture_retry_due = None;
         let location = self
             .capture_session
             .as_ref()
@@ -2032,6 +2229,29 @@ impl GreenViewerApp {
 
         let now = Instant::now();
         let due = self.next_capture_due.unwrap_or(now);
+
+        // A failed scheduled frame may retry during its own time slot, but never
+        // blocks the next scheduled frame indefinitely.
+        if self.pending_capture.is_some() {
+            if now >= due && !self.source_loading {
+                self.abandon_failed_capture_slot("next scheduled frame is due");
+            } else if self
+                .capture_retry_due
+                .is_some_and(|retry_due| now >= retry_due)
+                && !self.source_loading
+            {
+                if let Some(url) = self.capture_url.clone() {
+                    self.capture_retry_due = None;
+                    self.queue_source(SourceRequest::CaptureUrl(url));
+                    let new_source_id = self.active_source_id;
+                    if let Some(pending) = self.pending_capture.as_mut() {
+                        pending.source_id = new_source_id;
+                        pending.retry_count = pending.retry_count.saturating_add(1);
+                    }
+                }
+            }
+        }
+
         if now >= due
             && self.pending_capture.is_none()
             && !self.source_loading
@@ -2078,6 +2298,8 @@ impl GreenViewerApp {
                 file_name,
                 captured_at,
                 sequence_frame_index: None,
+                retry_count: 0,
+                failure_notified: false,
             });
             if !self.source_loading {
                 self.pending_capture = None;
@@ -2089,11 +2311,16 @@ impl GreenViewerApp {
             );
         }
 
-        let delay = match self.next_capture_due {
+        let frame_delay = match self.next_capture_due {
             Some(next) if next > now => next.duration_since(now),
             _ => Duration::from_millis(100),
         };
-        ctx.request_repaint_after(delay.min(Duration::from_secs(1)));
+        let retry_delay = match self.capture_retry_due {
+            Some(next) if next > now => next.duration_since(now),
+            Some(_) => Duration::from_millis(10),
+            None => Duration::from_secs(1),
+        };
+        ctx.request_repaint_after(frame_delay.min(retry_delay).min(Duration::from_secs(1)));
     }
 
     fn remove_pending_capture_sequence_frame(&mut self) {
@@ -3175,7 +3402,7 @@ time: {}", format_absolute_time(timestamp)));
                 viewer::OverlayPoint {
                     id: Some(group.id),
                     pixel,
-                    color: track_color(group.id),
+                    color: shape_series_color(group.id),
                     label,
                     radius: pivot_radius_for_area(area),
                     hover_text,
@@ -3485,6 +3712,19 @@ time: {}", format_absolute_time(timestamp)));
 
         ui.separator();
         ui.collapsing("Status", |ui| {
+            let current_time = format_status_time(self.status_changed_at);
+            if let Some(error) = self.error.as_ref() {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("[{current_time}] {error}"),
+                );
+                if self.status != *error {
+                    ui.monospace(format!("state: {}", self.status));
+                }
+            } else {
+                ui.monospace(format!("[{current_time}] {}", self.status));
+            }
+
             if self.source_loading {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -3497,11 +3737,29 @@ time: {}", format_absolute_time(timestamp)));
                         .show_percentage()
                         .desired_width(300.0),
                 );
-            } else if let Some(error) = self.error.as_ref() {
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
-            } else {
-                ui.label(&self.status);
             }
+
+            ui.small(&self.telegram_config_status);
+            ui.collapsing(format!("History ({})", self.status_history.len()), |ui| {
+                if ui.small_button("Clear status history").clicked() {
+                    self.status_history.clear();
+                    self.preferences_dirty = true;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("status-history-scroll")
+                    .max_height(260.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for entry in self.status_history.iter() {
+                            let text = format!("[{}] {}", format_status_time(entry.time), entry.text);
+                            if entry.is_error {
+                                ui.colored_label(egui::Color32::LIGHT_RED, text);
+                            } else {
+                                ui.monospace(text);
+                            }
+                        }
+                    });
+            });
         });
         ui.separator();
 
@@ -4530,7 +4788,7 @@ time: {}", format_absolute_time(timestamp)));
                     ui.checkbox(&mut track.enabled, "");
                     let grouped = group_counts.get(&track.group_id).copied().unwrap_or(1);
                     ui.colored_label(
-                        track_color(track.group_id),
+                        shape_series_color(track.group_id),
                         if grouped > 1 {
                             format!("G{} / T{}", track.group_id, track.id)
                         } else {
@@ -5096,6 +5354,7 @@ impl eframe::App for GreenViewerApp {
         self.tick_continuous_capture(&ctx);
         self.handle_global_shortcuts(&ctx);
         self.tick_sequence_playback(&ctx);
+        self.sync_status_history();
 
         egui::CentralPanel::default().show(ui, |ui| self.previews(ui));
 
@@ -5121,6 +5380,7 @@ impl eframe::App for GreenViewerApp {
         }
 
         self.timeseries_plot_windows(&ctx);
+        self.sync_status_history();
         self.tick_preference_persistence(&ctx);
     }
 }
@@ -5134,7 +5394,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.8.1")
+        .user_agent("rust-edge-gui/0.8.2")
         .build()
         .expect("failed to build HTTP client");
 
@@ -5996,6 +6256,10 @@ fn series_color(seed: u64) -> egui::Color32 {
     track_color(seed.max(1))
 }
 
+fn shape_series_color(group_id: u64) -> egui::Color32 {
+    series_color(stable_series_seed(&shape_series_key(group_id)))
+}
+
 fn format_compact_number(value: f64) -> String {
     let abs = value.abs();
     if abs >= 1_000_000.0 {
@@ -6332,6 +6596,11 @@ fn load_image_sequence(root: &Path) -> Result<ImageSequence> {
         frames,
         selected: 0,
     })
+}
+
+fn format_status_time(time: SystemTime) -> String {
+    let date_time: DateTime<Local> = time.into();
+    date_time.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn format_absolute_time(time: SystemTime) -> String {

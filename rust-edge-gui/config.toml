@@ -1,0 +1,11 @@
+# Runtime-only credentials/settings. Fill these locally before starting the app.
+# You can point to another config file with RUST_EDGE_GUI_CONFIG=/path/to/config.toml.
+
+[telegram]
+enabled = false
+bot_token = ""
+chat_id = ""
+
+# When a scheduled camera frame fails to load, retry this often, but only until
+# the next scheduled frame is due. The first failure and later recovery are notified.
+retry_cooldown_seconds = 10.0
