@@ -1,9 +1,37 @@
-# rust-edge-gui 0.7.6
+# rust-edge-gui 0.8.1
 
-Rust/egui plant-mask viewer for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, pixel inspection, fast color masks, native offline YOLO segmentation, per-window navigation, sequence playback, temporal false-positive filtering, and tracked mask-area plots.
+Rust/egui plant-mask viewer and timeseries dashboard for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, native offline YOLO segmentation, temporal filtering, automatic plant/leaf tracking, multiple resizable plots, and external Home Assistant sensor timeseries.
 
+## What changed in 0.8.1
 
+- **Build fix** — `reqwest` now enables its `json` feature, fixing the missing `Response::json()` method in the Home Assistant worker.
+- **Delete current frame** — the sequence transport can remove the selected frame from disk and `sequence.json`. Matching `original/` and `processed/` files are cleaned up together when they share the same capture filename.
+- **Tracking-safe deletion** — temporal caches and track observation indices are shifted after deletion. Tracks whose anchor frame was deleted are re-anchored to the nearest surviving confirmed observation when possible.
+- **Immediate continuation** — after deletion the nearest remaining frame is loaded automatically; if the sequence becomes empty, the active sequence root remains available so recording can be continued into it.
 
+## What changed in 0.8.0
+
+- **Live pivot lifecycle** — temporal filtering now keeps both pre-temporal and final masks. As future frames arrive, previously provisional false-positive components can disappear together with their automatic pivots, while newly confirmed sprouts automatically gain new pivots.
+- **Multiple plot windows** — create as many independent plot windows as needed. Each tracked-shape area or external sensor series can be assigned to any plot.
+- **Generic timeseries manager** — every series has an editable display name, editable logical group, visibility toggle, and target plot.
+- **Move whole groups** — move all members of a named group to another plot in one operation instead of moving individual series.
+- **Shift-rectangle grouping** — in the Processed image hold `Shift` and drag a rectangle around pivots. The selected shape-area timeseries are assigned to a new logical `selection-N` group. This changes dashboard grouping only; it does not alter biological collision-group identity.
+- **Home Assistant / FlowerCare bridge** — configure a Home Assistant URL and Long-Lived Access Token, add numeric `sensor.*` entity IDs, fetch current values, backfill history, and optionally auto-poll them into the same plot system as plant area.
+- **Persistent dashboard layout** — plot windows, titles, assignments, series names/groups, Home Assistant configuration, plot pan/zoom and window geometry persist across relaunches. The HA token is persisted only if `Remember token` is enabled.
+
+## Home Assistant / FlowerCare quick setup
+
+1. In Home Assistant, open your user profile and create/copy a **Long-Lived Access Token**.
+2. In rust-edge-gui open **Home Assistant / FlowerCare timeseries**.
+3. Enter the Home Assistant base URL, for example `http://homeassistant.local:8123`, and paste the token.
+4. In Home Assistant **Developer Tools → States**, find the exact numeric entity IDs exposed by your FlowerCare integration. Installations differ, so use the IDs shown by your own Home Assistant rather than assuming a fixed name.
+5. Add each desired entity ID. Leave **attribute** blank to use its primary numeric state; use the optional attribute field only when the numeric value lives in an entity attribute.
+6. Use **Fetch now** for current readings or **Load history** for a configurable historical time range. Enable **Auto poll** for live updates.
+7. In **Timeseries / plot windows**, rename the imported series, put related sensors in a group such as `FlowerCare`, and choose the plot window where they should render. The whole group can then be moved between plots at once.
+
+Common FlowerCare measurements exposed by integrations include soil moisture, temperature, conductivity/EC, illuminance and battery, but exact entity IDs depend on the integration and device naming in Home Assistant.
+
+See `HOME_ASSISTANT.md` for a compact setup/reference guide.
 
 ## What changed in 0.7.6
 

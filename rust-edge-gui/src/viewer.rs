@@ -13,6 +13,8 @@ pub struct ImageViewState {
     pub fit_to_window: bool,
     pub window_pos: Option<egui::Pos2>,
     pub window_size: Option<egui::Vec2>,
+    /// Runtime-only Shift+drag selection anchor used by the processed view.
+    pub selection_start: Option<egui::Pos2>,
 }
 
 impl Default for ImageViewState {
@@ -24,6 +26,7 @@ impl Default for ImageViewState {
             fit_to_window: true,
             window_pos: None,
             window_size: None,
+            selection_start: None,
         }
     }
 }
@@ -58,10 +61,12 @@ pub struct OverlayPoint {
     pub hover_text: String,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ViewInteraction {
     pub pivot_pixel: Option<(u32, u32)>,
     pub toggle_overlay_id: Option<u64>,
+    /// Overlay/timeseries ids contained by a completed Shift+drag rectangle.
+    pub selected_overlay_ids: Vec<u64>,
 }
 
 pub fn show_floating_image_window(
@@ -159,7 +164,7 @@ fn show_image_window_contents(
     });
 
     if allow_pivot_hotkey {
-        ui.small("Drag = move · two-finger scroll = pan · pinch/Ctrl+wheel = zoom · P = track mask shape under cursor");
+        ui.small("Drag = move · two-finger scroll = pan · pinch/Ctrl+wheel = zoom · P = add/remove pivot · Shift+drag = group pivots in rectangle");
     } else {
         ui.small("Drag = move · two-finger scroll = pan · pinch/Ctrl+wheel = zoom");
     }
@@ -196,7 +201,11 @@ fn show_image_window_contents(
 
     // Every window owns its own ImageViewState. Gestures are applied only to the
     // image viewport currently under the pointer; no transforms are mirrored.
-    if response.dragged() {
+    let shift_down = ui.input(|input| input.modifiers.shift);
+    if response.drag_started() && allow_pivot_hotkey && shift_down {
+        state.selection_start = response.interact_pointer_pos();
+    }
+    if response.dragged() && !(allow_pivot_hotkey && shift_down && state.selection_start.is_some()) {
         let delta = ui.input(|input| input.pointer.delta());
         if delta != egui::Vec2::ZERO {
             state.fit_to_window = false;
@@ -259,6 +268,52 @@ fn show_image_window_contents(
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(id, _)| id)
     });
+
+    let overlay_screen_pos = |point: &OverlayPoint| -> Option<egui::Pos2> {
+        let px = point.pixel.0 as f32 + 0.5;
+        let py = point.pixel.1 as f32 + 0.5;
+        if px < 0.0 || py < 0.0 || px >= image_size.x || py >= image_size.y {
+            return None;
+        }
+        Some(egui::pos2(
+            image_rect.min.x + px / image_size.x * image_rect.width(),
+            image_rect.min.y + py / image_size.y * image_rect.height(),
+        ))
+    };
+
+    if allow_pivot_hotkey {
+        if let (Some(start), Some(current)) = (state.selection_start, response.hover_pos()) {
+            let selection = egui::Rect::from_two_pos(start, current);
+            painter.rect_stroke(
+                selection,
+                0.0,
+                egui::Stroke::new(1.5, egui::Color32::YELLOW),
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_filled(
+                selection,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(255, 230, 40, 24),
+            );
+        }
+        if response.drag_stopped() {
+            if let (Some(start), Some(end)) = (state.selection_start.take(), response.interact_pointer_pos()) {
+                let selection = egui::Rect::from_two_pos(start, end);
+                interaction.selected_overlay_ids = overlays
+                    .iter()
+                    .filter_map(|point| {
+                        let id = point.id?;
+                        let screen = overlay_screen_pos(point)?;
+                        selection.contains(screen).then_some(id)
+                    })
+                    .collect();
+                interaction.selected_overlay_ids.sort_unstable();
+                interaction.selected_overlay_ids.dedup();
+            }
+        } else if !response.dragged() && !shift_down {
+            state.selection_start = None;
+        }
+    }
 
     for point in overlays {
         let px = point.pixel.0 as f32 + 0.5;

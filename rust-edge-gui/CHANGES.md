@@ -1,5 +1,25 @@
 # Changes
 
+## 0.8.1
+
+- Fix Home Assistant compilation by enabling reqwest's `json` feature, making `blocking::Response::json()` available.
+- Add `Delete current frame` to sequence transport. Deletion removes the current backing image plus the matching original/processed counterpart when present and rewrites `sequence.json`.
+- Reindex temporal raw/final mask caches and tracked-shape observations after frame deletion so subsequent frame numbers remain consistent.
+- If a deleted frame was a pivot anchor, re-anchor the track to the nearest surviving confirmed observation; drop the track only when no surviving observation exists.
+- Reload the nearest remaining frame after deletion and keep empty active sequences usable for continued capture.
+- Bump package version to 0.8.1.
+
+## 0.8.0
+
+- Add raw pre-temporal mask caching so later frames can both remove false positives and restore newly confirmed sprouts.
+- Automatically retire temporal-filtered automatic pivots and automatically create pivots for newly confirmed closed shapes during live sequences.
+- Add multiple independent plot windows with per-series target assignment.
+- Add generic timeseries metadata: editable name, logical group, visibility and plot target.
+- Add whole-group plot moves and Shift+drag rectangle grouping of Processed-image shape series.
+- Add Home Assistant REST integration for numeric sensor states/history, including FlowerCare sensor entities, manual fetch, historical backfill and periodic polling.
+- Persist plot windows, timeseries metadata and Home Assistant configuration; tokens are only stored when explicitly requested.
+- Bump package version to 0.8.0.
+
 ## 0.7.6
 
 - Add independent two-axis trackpad navigation to the tracked-size plot: horizontal scroll pans time, vertical scroll pans area.

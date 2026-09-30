@@ -1,5 +1,6 @@
 mod viewer;
 mod yolo;
+mod home_assistant;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -19,11 +20,13 @@ use yolo::{
     YoloDevice, YoloMessage, YoloModelInfo, YoloPostSettings, YoloRequest,
     YoloRuntimeSettings, YoloWorker,
 };
+use home_assistant::{HaMessage, HaRequest, HaRequestKind, HaSeriesRequest, HaWorker};
 
-const APP_TITLE: &str = "Rust Edge GUI v0.7.6 — Plot Navigation & Scaled Pivots";
+const APP_TITLE: &str = "Rust Edge GUI v0.8.1 — Timeseries Dashboard & Frame Management";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
+const MAX_EXTERNAL_SERIES_POINTS: usize = 50_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetectionMode {
@@ -149,6 +152,10 @@ struct ProcessingRequest {
 
 struct ProcessingResult {
     processed: RgbaImage,
+    /// Component-filtered mask before temporal persistence filtering. Keeping this
+    /// separately lets later frames both remove false positives and restore newly
+    /// confirmed sprouts in older frames.
+    raw_shape_mask: Vec<bool>,
     mask: Vec<bool>,
     width: usize,
     height: usize,
@@ -359,6 +366,7 @@ impl PersistedViewState {
             fit_to_window: self.fit_to_window,
             window_pos: self.window_pos.map(|p| egui::pos2(p[0], p[1])),
             window_size: self.window_size.map(|v| egui::vec2(v[0].max(300.0), v[1].max(240.0))),
+            selection_start: None,
         }
     }
 }
@@ -381,7 +389,111 @@ fn default_plot_center() -> f64 { 0.5 }
 fn default_plot_center_f32() -> f32 { 0.5 }
 fn default_plot_zoom() -> f32 { 1.0 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SeriesMeta {
+    key: String,
+    name: String,
+    group: String,
+    plot_id: u64,
+    #[serde(default = "default_true")]
+    visible: bool,
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HaSeriesConfig {
+    key: String,
+    entity_id: String,
+    #[serde(default)]
+    attribute: String,
+}
+
+#[derive(Clone, Debug)]
+struct HaSeriesData {
+    unit: String,
+    friendly_name: String,
+    points: BTreeMap<SystemTime, f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedPlotWindow {
+    id: u64,
+    title: String,
+    open: bool,
+    pos: [f32; 2],
+    size: [f32; 2],
+    #[serde(default = "default_plot_center")]
+    x_center: f64,
+    #[serde(default = "default_plot_zoom")]
+    x_zoom: f32,
+    #[serde(default = "default_plot_center_f32")]
+    y_center: f32,
+    #[serde(default = "default_plot_zoom")]
+    y_zoom: f32,
+}
+
+#[derive(Clone, Debug)]
+struct PlotWindowState {
+    id: u64,
+    title: String,
+    open: bool,
+    pos: egui::Pos2,
+    size: egui::Vec2,
+    x_center: f64,
+    x_zoom: f32,
+    y_center: f32,
+    y_zoom: f32,
+}
+
+impl PlotWindowState {
+    fn from_persisted(value: PersistedPlotWindow) -> Self {
+        Self {
+            id: value.id.max(1),
+            title: if value.title.trim().is_empty() { format!("Plot {}", value.id.max(1)) } else { value.title },
+            open: value.open,
+            pos: egui::pos2(value.pos[0], value.pos[1]),
+            size: egui::vec2(value.size[0].max(160.0), value.size[1].max(58.0)),
+            x_center: value.x_center.clamp(0.0, 1.0),
+            x_zoom: value.x_zoom.clamp(1.0, 10_000.0),
+            y_center: value.y_center.clamp(0.0, 1.0),
+            y_zoom: value.y_zoom.clamp(1.0, 10_000.0),
+        }
+    }
+
+    fn persisted(&self) -> PersistedPlotWindow {
+        PersistedPlotWindow {
+            id: self.id,
+            title: self.title.clone(),
+            open: self.open,
+            pos: [self.pos.x, self.pos.y],
+            size: [self.size.x, self.size.y],
+            x_center: self.x_center,
+            x_zoom: self.x_zoom,
+            y_center: self.y_center,
+            y_zoom: self.y_zoom,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlotPoint {
+    time: SystemTime,
+    value: f64,
+    frame: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct PlotSeriesData {
+    key: String,
+    name: String,
+    group: String,
+    unit: String,
+    color_seed: u64,
+    points: Vec<PlotPoint>,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
     version: u32,
@@ -466,6 +578,24 @@ struct PersistedState {
     sequence_history_input: String,
     #[serde(default)]
     sequence_glue_inputs: Vec<String>,
+    #[serde(default)]
+    plot_windows: Vec<PersistedPlotWindow>,
+    #[serde(default)]
+    series_meta: Vec<SeriesMeta>,
+    #[serde(default)]
+    ha_base_url: String,
+    #[serde(default)]
+    ha_token: String,
+    #[serde(default)]
+    ha_remember_token: bool,
+    #[serde(default)]
+    ha_auto_poll: bool,
+    #[serde(default)]
+    ha_poll_interval_secs: f32,
+    #[serde(default)]
+    ha_history_hours: f32,
+    #[serde(default)]
+    ha_series: Vec<HaSeriesConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -530,6 +660,9 @@ struct ShapeTrack {
     matched_centroids: BTreeMap<usize, (u32, u32)>,
     observations: BTreeMap<usize, ShapeObservation>,
     enabled: bool,
+    /// Auto-created pivots may be retired when temporal filtering confirms that
+    /// their shape disappeared. Manual P pivots are kept until the user removes them.
+    auto_created: bool,
 }
 
 
@@ -619,7 +752,12 @@ struct GreenViewerApp {
 
     current_final_mask: Option<Arc<Vec<bool>>>,
     active_processing_sequence_frame: Option<usize>,
+    /// Final masks after temporal filtering.
     sequence_mask_cache: BTreeMap<usize, CachedSequenceMask>,
+    /// Pre-temporal component masks. Temporal support must be computed from this
+    /// cache so a component that was initially filtered out can be restored once
+    /// future frames confirm it.
+    sequence_raw_mask_cache: BTreeMap<usize, CachedSequenceMask>,
     sequence_mask_cache_order: VecDeque<usize>,
     temporal_filter_enabled: bool,
     temporal_lookahead_frames: usize,
@@ -646,6 +784,30 @@ struct GreenViewerApp {
     sequence_wait_processing: bool,
     next_sequence_frame_due: Option<Instant>,
     sequence_glue_inputs: Vec<String>,
+
+    // Generic timeseries dashboard. Shape-area series and external Home Assistant
+    // sensors use the same metadata/plot assignment model.
+    series_meta: BTreeMap<String, SeriesMeta>,
+    plot_windows: Vec<PlotWindowState>,
+    next_plot_window_id: u64,
+    next_selection_group_id: u64,
+    auto_track_highwater_frame: Option<usize>,
+
+    ha_worker: HaWorker,
+    ha_base_url_input: String,
+    ha_token_input: String,
+    ha_remember_token: bool,
+    ha_auto_poll: bool,
+    ha_poll_interval_secs: f32,
+    ha_history_hours: f32,
+    ha_entity_id_input: String,
+    ha_attribute_input: String,
+    ha_series: Vec<HaSeriesConfig>,
+    ha_data: BTreeMap<String, HaSeriesData>,
+    ha_request_id: u64,
+    ha_request_pending: bool,
+    next_ha_poll: Option<Instant>,
+    ha_status: String,
 
     controls_window_pos: egui::Pos2,
     controls_window_size: egui::Vec2,
@@ -676,6 +838,7 @@ impl GreenViewerApp {
         let persisted_v2 = persisted.version >= 2;
         let persisted_v3 = persisted.version >= 3;
         let persisted_v4 = persisted.version >= 4;
+        let persisted_v5 = persisted.version >= 5;
         let image_history_input = if persisted_v2 && !persisted.image_history_input.is_empty() {
             persisted.image_history_input.clone()
         } else {
@@ -754,6 +917,61 @@ impl GreenViewerApp {
             persisted.temporal_required_frames.clamp(1, temporal_radius * 2)
         } else { 1 };
 
+        let mut plot_windows = if persisted_v5 && !persisted.plot_windows.is_empty() {
+            persisted
+                .plot_windows
+                .clone()
+                .into_iter()
+                .map(PlotWindowState::from_persisted)
+                .collect::<Vec<_>>()
+        } else {
+            vec![PlotWindowState {
+                id: 1,
+                title: "Plant / sensor plot".to_owned(),
+                open: if persisted_v2 { persisted.shape_plot_open } else { false },
+                pos: shape_plot_window.pos(),
+                size: shape_plot_window.size(),
+                x_center: if persisted_v4 { persisted.plot_x_center.clamp(0.0, 1.0) } else { 0.5 },
+                x_zoom: if persisted_v4 { persisted.plot_x_zoom.clamp(1.0, 10_000.0) } else { 1.0 },
+                y_center: if persisted_v4 { persisted.plot_y_center.clamp(0.0, 1.0) } else { 0.5 },
+                y_zoom: if persisted_v4 { persisted.plot_y_zoom.clamp(1.0, 10_000.0) } else { 1.0 },
+            }]
+        };
+        if plot_windows.is_empty() {
+            plot_windows.push(PlotWindowState {
+                id: 1,
+                title: "Plant / sensor plot".to_owned(),
+                open: false,
+                pos: shape_plot_window.pos(),
+                size: shape_plot_window.size(),
+                x_center: 0.5,
+                x_zoom: 1.0,
+                y_center: 0.5,
+                y_zoom: 1.0,
+            });
+        }
+        let next_plot_window_id = plot_windows.iter().map(|plot| plot.id).max().unwrap_or(0) + 1;
+        let series_meta = if persisted_v5 {
+            persisted
+                .series_meta
+                .clone()
+                .into_iter()
+                .map(|meta| (meta.key.clone(), meta))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        let ha_poll_interval_secs = if persisted.ha_poll_interval_secs >= 1.0 {
+            persisted.ha_poll_interval_secs.clamp(1.0, 86_400.0)
+        } else {
+            60.0
+        };
+        let ha_history_hours = if persisted.ha_history_hours > 0.0 {
+            persisted.ha_history_hours.clamp(0.1, 24.0 * 365.0)
+        } else {
+            24.0
+        };
+
         let mut app = Self {
             original_rgba: None,
             original_gray: None,
@@ -810,6 +1028,7 @@ impl GreenViewerApp {
             current_final_mask: None,
             active_processing_sequence_frame: None,
             sequence_mask_cache: BTreeMap::new(),
+            sequence_raw_mask_cache: BTreeMap::new(),
             sequence_mask_cache_order: VecDeque::new(),
             temporal_filter_enabled: if persisted_v2 { persisted.temporal_filter_enabled } else { false },
             temporal_lookahead_frames: temporal_window_frames,
@@ -831,6 +1050,26 @@ impl GreenViewerApp {
             sequence_wait_processing: if persisted_v2 { persisted.sequence_wait_processing } else { true },
             next_sequence_frame_due: None,
             sequence_glue_inputs: if persisted_v2 { persisted.sequence_glue_inputs.clone() } else { Vec::new() },
+            series_meta,
+            plot_windows,
+            next_plot_window_id,
+            next_selection_group_id: 1,
+            auto_track_highwater_frame: None,
+            ha_worker: HaWorker::spawn(cc.egui_ctx.clone()),
+            ha_base_url_input: if persisted_v5 { persisted.ha_base_url.clone() } else { String::new() },
+            ha_token_input: if persisted_v5 && persisted.ha_remember_token { persisted.ha_token.clone() } else { String::new() },
+            ha_remember_token: persisted_v5 && persisted.ha_remember_token,
+            ha_auto_poll: persisted_v5 && persisted.ha_auto_poll,
+            ha_poll_interval_secs,
+            ha_history_hours,
+            ha_entity_id_input: String::new(),
+            ha_attribute_input: String::new(),
+            ha_series: if persisted_v5 { persisted.ha_series.clone() } else { Vec::new() },
+            ha_data: BTreeMap::new(),
+            ha_request_id: 0,
+            ha_request_pending: false,
+            next_ha_poll: None,
+            ha_status: "Home Assistant idle".to_owned(),
             controls_window_pos: controls_window.pos(),
             controls_window_size: controls_window.size(),
             shape_plot_window_pos: shape_plot_window.pos(),
@@ -849,6 +1088,19 @@ impl GreenViewerApp {
             deferred_sequence_frame: None,
             next_capture_due: None,
         };
+
+        app.sync_home_assistant_series_metadata();
+        app.next_selection_group_id = app
+            .series_meta
+            .values()
+            .filter_map(|meta| meta.group.strip_prefix("selection-"))
+            .filter_map(|suffix| suffix.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if app.ha_auto_poll {
+            app.next_ha_poll = Some(Instant::now());
+        }
 
         if let Some(source) = initial_source {
             if source.starts_with("http://") || source.starts_with("https://") {
@@ -1065,7 +1317,7 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
-            version: 4,
+            version: 5,
             source_history: self.source_history.clone(),
             sequence_history: self.sequence_history.clone(),
             capture_base_dir: self.capture_base_dir_input.clone(),
@@ -1106,6 +1358,15 @@ impl GreenViewerApp {
             image_history_input: self.image_history_input.clone(),
             sequence_history_input: self.sequence_history_input.clone(),
             sequence_glue_inputs: self.sequence_glue_inputs.clone(),
+            plot_windows: self.plot_windows.iter().map(PlotWindowState::persisted).collect(),
+            series_meta: self.series_meta.values().cloned().collect(),
+            ha_base_url: self.ha_base_url_input.clone(),
+            ha_token: if self.ha_remember_token { self.ha_token_input.clone() } else { String::new() },
+            ha_remember_token: self.ha_remember_token,
+            ha_auto_poll: self.ha_auto_poll,
+            ha_poll_interval_secs: self.ha_poll_interval_secs,
+            ha_history_hours: self.ha_history_hours,
+            ha_series: self.ha_series.clone(),
         });
     }
 
@@ -1122,6 +1383,278 @@ impl GreenViewerApp {
         if self.preferences_dirty && self.next_preferences_save > now {
             ctx.request_repaint_after((self.next_preferences_save - now).min(Duration::from_secs(1)));
         }
+    }
+
+    fn default_plot_id(&self) -> u64 {
+        self.plot_windows.first().map(|plot| plot.id).unwrap_or(1)
+    }
+
+    fn spawn_plot_window(&mut self) -> u64 {
+        let id = self.next_plot_window_id.max(1);
+        self.next_plot_window_id = id.saturating_add(1);
+        let cascade = ((self.plot_windows.len() % 8) as f32) * 28.0;
+        self.plot_windows.push(PlotWindowState {
+            id,
+            title: format!("Plot {id}"),
+            open: true,
+            pos: egui::pos2(720.0 + cascade, 80.0 + cascade),
+            size: egui::vec2(680.0, 360.0),
+            x_center: 0.5,
+            x_zoom: 1.0,
+            y_center: 0.5,
+            y_zoom: 1.0,
+        });
+        self.save_preferences();
+        id
+    }
+
+    fn sync_shape_series_metadata(&mut self) {
+        let width = self
+            .original_rgba
+            .as_ref()
+            .map(|image| image.width() as usize)
+            .unwrap_or(0);
+        let groups = build_shape_group_series(&self.shape_tracks, width);
+        let active_keys = groups
+            .iter()
+            .map(|group| shape_series_key(group.id))
+            .collect::<BTreeSet<_>>();
+
+        self.series_meta.retain(|key, _| {
+            !key.starts_with("shape:") || active_keys.contains(key)
+        });
+        let default_plot = self.default_plot_id();
+        for group in groups {
+            let key = shape_series_key(group.id);
+            self.series_meta.entry(key.clone()).or_insert_with(|| SeriesMeta {
+                key,
+                name: group.name.clone(),
+                group: "Plant shapes".to_owned(),
+                plot_id: default_plot,
+                visible: true,
+            });
+        }
+    }
+
+    fn sync_home_assistant_series_metadata(&mut self) {
+        let default_plot = self.default_plot_id();
+        for config in &self.ha_series {
+            self.series_meta.entry(config.key.clone()).or_insert_with(|| SeriesMeta {
+                key: config.key.clone(),
+                name: config.entity_id.clone(),
+                group: "Home Assistant".to_owned(),
+                plot_id: default_plot,
+                visible: true,
+            });
+            self.ha_data.entry(config.key.clone()).or_insert_with(|| HaSeriesData {
+                unit: String::new(),
+                friendly_name: config.entity_id.clone(),
+                points: BTreeMap::new(),
+            });
+        }
+        let configured = self.ha_series.iter().map(|s| s.key.clone()).collect::<BTreeSet<_>>();
+        self.ha_data.retain(|key, _| configured.contains(key));
+        self.series_meta.retain(|key, _| !key.starts_with("ha:") || configured.contains(key));
+    }
+
+    fn group_selected_shape_series(&mut self, group_ids: &[u64]) {
+        if group_ids.is_empty() {
+            return;
+        }
+        self.sync_shape_series_metadata();
+        let group_name = format!("selection-{}", self.next_selection_group_id);
+        self.next_selection_group_id = self.next_selection_group_id.saturating_add(1);
+        let mut changed = 0usize;
+        for group_id in group_ids {
+            if let Some(meta) = self.series_meta.get_mut(&shape_series_key(*group_id)) {
+                meta.group = group_name.clone();
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.status = format!("Grouped {changed} selected shape timeseries as {group_name}.");
+            self.save_preferences();
+        }
+    }
+
+    fn add_home_assistant_series(&mut self) {
+        let entity_id = self.ha_entity_id_input.trim().to_owned();
+        if entity_id.is_empty() {
+            self.error = Some("Enter a Home Assistant entity_id first.".to_owned());
+            return;
+        }
+        let attribute = self.ha_attribute_input.trim().to_owned();
+        let key = ha_series_key(&entity_id, &attribute);
+        if self.ha_series.iter().any(|config| config.key == key) {
+            self.status = format!("{entity_id} is already configured.");
+            return;
+        }
+        self.ha_series.push(HaSeriesConfig {
+            key: key.clone(),
+            entity_id: entity_id.clone(),
+            attribute,
+        });
+        self.sync_home_assistant_series_metadata();
+        self.ha_entity_id_input.clear();
+        self.ha_attribute_input.clear();
+        self.status = format!("Added Home Assistant series {entity_id}.");
+        self.save_preferences();
+    }
+
+    fn queue_home_assistant_request(&mut self, kind: HaRequestKind) {
+        if self.ha_request_pending {
+            return;
+        }
+        if self.ha_series.is_empty() {
+            self.ha_status = "Add at least one Home Assistant sensor first.".to_owned();
+            return;
+        }
+        if self.ha_base_url_input.trim().is_empty() || self.ha_token_input.trim().is_empty() {
+            self.ha_status = "Home Assistant URL/token is missing.".to_owned();
+            return;
+        }
+        self.ha_request_id = self.ha_request_id.wrapping_add(1).max(1);
+        let request = HaRequest {
+            id: self.ha_request_id,
+            base_url: self.ha_base_url_input.trim().to_owned(),
+            token: self.ha_token_input.clone(),
+            series: self
+                .ha_series
+                .iter()
+                .map(|config| HaSeriesRequest {
+                    key: config.key.clone(),
+                    entity_id: config.entity_id.clone(),
+                    attribute: config.attribute.clone(),
+                })
+                .collect(),
+            kind,
+        };
+        match self.ha_worker.request_tx.send(request) {
+            Ok(()) => {
+                self.ha_request_pending = true;
+                self.ha_status = "Home Assistant request in progress…".to_owned();
+            }
+            Err(error) => {
+                self.ha_status = format!("Home Assistant worker unavailable: {error}");
+            }
+        }
+    }
+
+    fn poll_home_assistant_worker(&mut self) {
+        while let Ok(message) = self.ha_worker.message_rx.try_recv() {
+            match message {
+                HaMessage::Finished { id, samples } if id == self.ha_request_id => {
+                    self.ha_request_pending = false;
+                    let sample_count = samples.len();
+                    for sample in samples {
+                        let data = self.ha_data.entry(sample.key.clone()).or_insert_with(|| HaSeriesData {
+                            unit: sample.unit.clone(),
+                            friendly_name: sample.friendly_name.clone(),
+                            points: BTreeMap::new(),
+                        });
+                        if !sample.unit.is_empty() {
+                            data.unit = sample.unit.clone();
+                        }
+                        if !sample.friendly_name.is_empty() {
+                            data.friendly_name = sample.friendly_name.clone();
+                        }
+                        data.points.insert(sample.timestamp, sample.value);
+                        while data.points.len() > MAX_EXTERNAL_SERIES_POINTS {
+                            let Some(oldest) = data.points.keys().next().copied() else { break; };
+                            data.points.remove(&oldest);
+                        }
+                        if let Some(meta) = self.series_meta.get_mut(&sample.key) {
+                            let config_name = self
+                                .ha_series
+                                .iter()
+                                .find(|config| config.key == sample.key)
+                                .map(|config| config.entity_id.as_str())
+                                .unwrap_or_default();
+                            if meta.name == config_name && !sample.friendly_name.is_empty() {
+                                meta.name = sample.friendly_name;
+                            }
+                        }
+                    }
+                    self.ha_status = format!("Home Assistant: received {sample_count} sample(s).");
+                }
+                HaMessage::Failed { id, error } if id == self.ha_request_id || id == 0 => {
+                    self.ha_request_pending = false;
+                    self.ha_status = format!("Home Assistant error: {error}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn tick_home_assistant_poll(&mut self, ctx: &egui::Context) {
+        if !self.ha_auto_poll {
+            self.next_ha_poll = None;
+            return;
+        }
+        let now = Instant::now();
+        let due = self.next_ha_poll.unwrap_or(now);
+        if now >= due && !self.ha_request_pending {
+            self.queue_home_assistant_request(HaRequestKind::Snapshot);
+            self.next_ha_poll = Some(now + Duration::from_secs_f32(self.ha_poll_interval_secs.max(1.0)));
+        }
+        if let Some(next) = self.next_ha_poll {
+            ctx.request_repaint_after(next.saturating_duration_since(now).min(Duration::from_secs(1)));
+        }
+    }
+
+    fn collect_plot_series_for_plot(&self, plot_id: u64) -> Vec<PlotSeriesData> {
+        let width = self
+            .original_rgba
+            .as_ref()
+            .map(|image| image.width() as usize)
+            .unwrap_or(0);
+        let shape_groups = build_shape_group_series(&self.shape_tracks, width)
+            .into_iter()
+            .map(|group| (group.id, group))
+            .collect::<BTreeMap<_, _>>();
+        let mut result = Vec::new();
+        for meta in self.series_meta.values().filter(|meta| meta.visible && meta.plot_id == plot_id) {
+            if let Some(group_id) = parse_shape_series_key(&meta.key) {
+                let Some(group) = shape_groups.get(&group_id) else { continue; };
+                let Some(sequence) = self.active_sequence.as_ref() else { continue; };
+                let points = group
+                    .areas
+                    .iter()
+                    .filter_map(|(&frame, &area)| {
+                        let time = sequence.frames.get(frame)?.timestamp;
+                        Some(PlotPoint { time, value: area as f64, frame: Some(frame) })
+                    })
+                    .collect::<Vec<_>>();
+                if !points.is_empty() {
+                    result.push(PlotSeriesData {
+                        key: meta.key.clone(),
+                        name: meta.name.clone(),
+                        group: meta.group.clone(),
+                        unit: "px".to_owned(),
+                        color_seed: stable_series_seed(&meta.key),
+                        points,
+                    });
+                }
+            } else if meta.key.starts_with("ha:") {
+                let Some(data) = self.ha_data.get(&meta.key) else { continue; };
+                let points = data
+                    .points
+                    .iter()
+                    .map(|(&time, &value)| PlotPoint { time, value, frame: None })
+                    .collect::<Vec<_>>();
+                if !points.is_empty() {
+                    result.push(PlotSeriesData {
+                        key: meta.key.clone(),
+                        name: meta.name.clone(),
+                        group: meta.group.clone(),
+                        unit: data.unit.clone(),
+                        color_seed: stable_series_seed(&meta.key),
+                        points,
+                    });
+                }
+            }
+        }
+        result
     }
 
     fn open_image_from_history_field(&mut self) {
@@ -1166,10 +1699,13 @@ impl GreenViewerApp {
                 self.current_final_mask = None;
                 self.active_processing_sequence_frame = None;
                 self.sequence_mask_cache.clear();
+                self.sequence_raw_mask_cache.clear();
                 self.sequence_mask_cache_order.clear();
                 self.shape_tracks.clear();
+                self.auto_track_highwater_frame = None;
                 self.auto_seed_pivots_pending = true;
                 self.shape_plot_open = false;
+                self.sync_shape_series_metadata();
                 self.remember_sequence(root_label.clone());
                 self.status = format!("Opened image sequence {root_label}");
                 self.error = None;
@@ -1447,9 +1983,12 @@ impl GreenViewerApp {
         self.current_final_mask = None;
         self.active_processing_sequence_frame = None;
         self.sequence_mask_cache.clear();
+        self.sequence_raw_mask_cache.clear();
         self.sequence_mask_cache_order.clear();
         self.shape_tracks.clear();
+        self.auto_track_highwater_frame = None;
         self.auto_seed_pivots_pending = true;
+        self.sync_shape_series_metadata();
         self.capture_url = Some(url);
         self.pending_capture = None;
         self.processing_capture = None;
@@ -1895,12 +2434,14 @@ impl GreenViewerApp {
                         self.save_pending_capture_processed(id, &result.processed);
                     let frame_index = committed_capture_index.or(self.active_processing_sequence_frame);
                     if let Some(frame_index) = frame_index {
-                        self.cache_sequence_mask(
+                        self.cache_sequence_masks(
                             frame_index,
                             result.width,
                             result.height,
+                            Arc::new(result.raw_shape_mask.clone()),
                             Arc::clone(&frame_mask),
                         );
+                        self.refresh_temporal_cache_around(frame_index);
                         self.seed_all_shapes_from_mask(
                             frame_index,
                             result.width,
@@ -1971,14 +2512,14 @@ impl GreenViewerApp {
 
         for offset in 1..=radius {
             if let Some(index) = current.checked_sub(offset) {
-                if let Some(cached) = self.sequence_mask_cache.get(&index) {
+                if let Some(cached) = self.sequence_raw_mask_cache.get(&index) {
                     if expected_dims.is_none_or(|dims| dims == (cached.width, cached.height)) {
                         support.push(Arc::clone(&cached.mask));
                     }
                 }
             }
             if let Some(index) = current.checked_add(offset).filter(|index| *index < sequence.frames.len()) {
-                if let Some(cached) = self.sequence_mask_cache.get(&index) {
+                if let Some(cached) = self.sequence_raw_mask_cache.get(&index) {
                     if expected_dims.is_none_or(|dims| dims == (cached.width, cached.height)) {
                         support.push(Arc::clone(&cached.mask));
                     }
@@ -1992,19 +2533,28 @@ impl GreenViewerApp {
         }
     }
 
-    fn cache_sequence_mask(
+    fn cache_sequence_masks(
         &mut self,
         frame_index: usize,
         width: usize,
         height: usize,
-        mask: Arc<Vec<bool>>,
+        raw_mask: Arc<Vec<bool>>,
+        final_mask: Arc<Vec<bool>>,
     ) {
+        self.sequence_raw_mask_cache.insert(
+            frame_index,
+            CachedSequenceMask {
+                width,
+                height,
+                mask: raw_mask,
+            },
+        );
         self.sequence_mask_cache.insert(
             frame_index,
             CachedSequenceMask {
                 width,
                 height,
-                mask,
+                mask: final_mask,
             },
         );
         self.sequence_mask_cache_order.retain(|index| *index != frame_index);
@@ -2012,7 +2562,114 @@ impl GreenViewerApp {
         while self.sequence_mask_cache_order.len() > MAX_SEQUENCE_MASK_CACHE {
             if let Some(oldest) = self.sequence_mask_cache_order.pop_front() {
                 self.sequence_mask_cache.remove(&oldest);
+                self.sequence_raw_mask_cache.remove(&oldest);
             }
+        }
+    }
+
+    fn refresh_temporal_cache_around(&mut self, newest_frame: usize) {
+        if !self.temporal_filter_enabled || self.temporal_required_frames == 0 {
+            return;
+        }
+        let radius = self.temporal_support_radius();
+        let first = newest_frame.saturating_sub(radius);
+        let last = newest_frame.saturating_add(radius);
+        let affected = (first..=last)
+            .filter(|frame_index| *frame_index != newest_frame)
+            .filter(|frame_index| self.sequence_raw_mask_cache.contains_key(frame_index))
+            .collect::<Vec<_>>();
+        for frame_index in affected {
+            let Some(cached) = self.sequence_raw_mask_cache.get(&frame_index) else { continue; };
+            let width = cached.width;
+            let height = cached.height;
+            let base = Arc::clone(&cached.mask);
+            let mut support = Vec::new();
+            for offset in 1..=radius {
+                if let Some(index) = frame_index.checked_sub(offset) {
+                    if let Some(mask) = self.sequence_raw_mask_cache.get(&index) {
+                        if mask.width == width && mask.height == height {
+                            support.push(Arc::clone(&mask.mask));
+                        }
+                    }
+                }
+                if let Some(index) = frame_index.checked_add(offset) {
+                    if let Some(mask) = self.sequence_raw_mask_cache.get(&index) {
+                        if mask.width == width && mask.height == height {
+                            support.push(Arc::clone(&mask.mask));
+                        }
+                    }
+                }
+            }
+            if support.len() < self.temporal_required_frames {
+                continue;
+            }
+            let (filtered, _) = filter_mask_by_temporal_support(
+                base.as_ref(),
+                width,
+                height,
+                &support,
+                self.temporal_required_frames,
+                self.temporal_overlap_threshold,
+            );
+            let unchanged = self
+                .sequence_mask_cache
+                .get(&frame_index)
+                .is_some_and(|current| current.mask.as_ref() == &filtered);
+            if unchanged {
+                continue;
+            }
+            let filtered = Arc::new(filtered);
+            if let Some(entry) = self.sequence_mask_cache.get_mut(&frame_index) {
+                entry.mask = Arc::clone(&filtered);
+            }
+            self.retire_auto_anchors_removed_by_filter(frame_index, width, height, filtered.as_ref());
+            // Historical observations are recomputed, but lifecycle spawning is
+            // intentionally reserved for the high-water/newest frame.
+            let components = extract_mask_components(filtered.as_ref(), width, height);
+            let threshold = self.track_overlap_threshold.clamp(0.0, 1.0);
+            for track in &mut self.shape_tracks {
+                if !track.enabled || track.anchor_width != width || track.anchor_height != height {
+                    continue;
+                }
+                if frame_index != track.anchor_frame {
+                    track.observations.remove(&frame_index);
+                    track.matched_pixels.remove(&frame_index);
+                    track.matched_centroids.remove(&frame_index);
+                    update_one_shape_track(track, frame_index, width, &components, threshold);
+                }
+            }
+            self.merge_colliding_shape_groups(frame_index);
+        }
+        self.sync_shape_series_metadata();
+    }
+
+    fn retire_auto_anchors_removed_by_filter(
+        &mut self,
+        frame_index: usize,
+        width: usize,
+        height: usize,
+        mask: &[bool],
+    ) {
+        let threshold = self.track_overlap_threshold.clamp(0.0, 1.0);
+        let components = extract_mask_components(mask, width, height);
+        let invalid = self
+            .shape_tracks
+            .iter()
+            .filter(|track| {
+                track.auto_created
+                    && track.anchor_frame == frame_index
+                    && track.anchor_width == width
+                    && track.anchor_height == height
+            })
+            .filter(|track| {
+                !components.iter().any(|component| {
+                    component_overlap_score(&track.anchor_pixels, &component.pixels) + f32::EPSILON >= threshold
+                })
+            })
+            .map(|track| track.id)
+            .collect::<BTreeSet<_>>();
+        if !invalid.is_empty() {
+            self.shape_tracks.retain(|track| !invalid.contains(&track.id));
         }
     }
 
@@ -2023,19 +2680,168 @@ impl GreenViewerApp {
         height: usize,
         mask: &[bool],
     ) {
-        if self.shape_tracks.is_empty() || mask.len() != width.saturating_mul(height) {
+        if mask.len() != width.saturating_mul(height) {
             return;
         }
         let components = extract_mask_components(mask, width, height);
-        if components.is_empty() {
-            return;
-        }
         let threshold = self.track_overlap_threshold.clamp(0.0, 1.0);
         for track in &mut self.shape_tracks {
             if !track.enabled || track.anchor_width != width || track.anchor_height != height {
                 continue;
             }
+            // Re-processing a frame after temporal support changes must not leave a
+            // stale match behind. Auto anchors are validated separately below.
+            if frame_index != track.anchor_frame {
+                track.observations.remove(&frame_index);
+                track.matched_pixels.remove(&frame_index);
+                track.matched_centroids.remove(&frame_index);
+            }
             update_one_shape_track(track, frame_index, width, &components, threshold);
+        }
+        self.merge_colliding_shape_groups(frame_index);
+        self.reconcile_auto_shape_tracks(frame_index, width, height, &components);
+        self.sync_shape_series_metadata();
+    }
+
+    fn reconcile_auto_shape_tracks(
+        &mut self,
+        frame_index: usize,
+        width: usize,
+        height: usize,
+        components: &[MaskComponent],
+    ) {
+        // Lifecycle changes only move forward in time. Seeking backwards should
+        // inspect history, not delete or spawn identities again.
+        if self
+            .auto_track_highwater_frame
+            .is_some_and(|highwater| frame_index < highwater)
+        {
+            return;
+        }
+        self.auto_track_highwater_frame = Some(frame_index);
+        let threshold = self.track_overlap_threshold.clamp(0.0, 1.0);
+        let closed = components
+            .iter()
+            .filter(|component| component_is_closed(component, width, height))
+            .collect::<Vec<_>>();
+
+        // If temporal re-filtering removes the very component that created an
+        // automatic pivot, retire that false-positive identity immediately.
+        let mut invalid_auto_ids = BTreeSet::new();
+        for track in self.shape_tracks.iter().filter(|track| {
+            track.enabled
+                && track.auto_created
+                && track.anchor_frame == frame_index
+                && track.anchor_width == width
+                && track.anchor_height == height
+        }) {
+            let still_exists = closed.iter().any(|component| {
+                component_overlap_score(&track.anchor_pixels, &component.pixels) + f32::EPSILON
+                    >= threshold
+            });
+            if !still_exists {
+                invalid_auto_ids.insert(track.id);
+            }
+        }
+        if !invalid_auto_ids.is_empty() {
+            self.shape_tracks
+                .retain(|track| !invalid_auto_ids.contains(&track.id));
+        }
+
+        // Once a whole automatically-created logical group is absent for a
+        // temporal-support-sized grace period, remove its pivots. Manual P tracks
+        // deliberately survive until explicitly removed.
+        let grace = if self.temporal_filter_enabled {
+            self.temporal_support_radius().max(1)
+        } else {
+            2
+        };
+        let mut group_members = BTreeMap::<u64, Vec<usize>>::new();
+        for (index, track) in self.shape_tracks.iter().enumerate() {
+            group_members.entry(track.group_id).or_default().push(index);
+        }
+        let mut retire_groups = BTreeSet::new();
+        for (group_id, members) in group_members {
+            if members.iter().any(|&index| !self.shape_tracks[index].auto_created) {
+                continue;
+            }
+            let last_seen = members
+                .iter()
+                .flat_map(|&index| self.shape_tracks[index].matched_pixels.keys().copied())
+                .max();
+            if let Some(last_seen) = last_seen {
+                if frame_index > last_seen.saturating_add(grace) {
+                    retire_groups.insert(group_id);
+                }
+            }
+        }
+        if !retire_groups.is_empty() {
+            self.shape_tracks
+                .retain(|track| !retire_groups.contains(&track.group_id));
+        }
+
+        // Every closed component that is not already represented by an existing
+        // track becomes a new automatic pivot. This is what makes new sprouts
+        // appear in the dashboard without manual P presses.
+        let represented = self
+            .shape_tracks
+            .iter()
+            .filter(|track| track.enabled && track.anchor_width == width && track.anchor_height == height)
+            .filter_map(|track| track.matched_pixels.get(&frame_index))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut created_ids = Vec::new();
+        for component in closed {
+            let already_tracked = represented.iter().any(|pixels| {
+                component_overlap_score(pixels, &component.pixels) + f32::EPSILON >= threshold
+            }) || self.shape_tracks.iter().any(|track| {
+                track.enabled
+                    && track.anchor_width == width
+                    && track.anchor_height == height
+                    && component_overlap_score(&track.anchor_pixels, &component.pixels) + f32::EPSILON >= threshold
+                    && frame_index.abs_diff(track.anchor_frame) <= grace
+            });
+            if already_tracked {
+                continue;
+            }
+            self.next_track_id = self.next_track_id.wrapping_add(1).max(1);
+            let track_id = self.next_track_id;
+            let pivot = component_centroid(component, width);
+            let anchor_pixels = component.pixels.clone();
+            let mut observations = BTreeMap::new();
+            observations.insert(
+                frame_index,
+                ShapeObservation { area: component.area, overlap: 1.0 },
+            );
+            let mut matched_pixels = BTreeMap::new();
+            matched_pixels.insert(frame_index, anchor_pixels.clone());
+            let mut matched_centroids = BTreeMap::new();
+            matched_centroids.insert(frame_index, pivot);
+            self.shape_tracks.push(ShapeTrack {
+                id: track_id,
+                group_id: track_id,
+                name: format!("shape-{track_id}"),
+                anchor_pivot: pivot,
+                anchor_frame: frame_index,
+                anchor_width: width,
+                anchor_height: height,
+                anchor_pixels,
+                matched_pixels,
+                matched_centroids,
+                observations,
+                enabled: true,
+                auto_created: true,
+            });
+            created_ids.push(track_id);
+        }
+        if !created_ids.is_empty() {
+            self.shape_plot_open = true;
+            if let Some(plot) = self.plot_windows.first_mut() {
+                plot.open = true;
+            }
+        }
+        for track_id in created_ids {
+            self.rebuild_shape_track_from_cached_masks(track_id);
         }
         self.merge_colliding_shape_groups(frame_index);
     }
@@ -2138,11 +2944,18 @@ impl GreenViewerApp {
                 matched_centroids,
                 observations,
                 enabled: true,
+                auto_created: true,
             });
             created.push(track_id);
         }
         self.auto_seed_pivots_pending = false;
+        self.auto_track_highwater_frame = Some(frame_index);
         self.shape_plot_open = !created.is_empty();
+        if !created.is_empty() {
+            if let Some(plot) = self.plot_windows.first_mut() {
+                plot.open = true;
+            }
+        }
         for track_id in created.iter().copied() {
             self.rebuild_shape_track_from_cached_masks(track_id);
         }
@@ -2150,6 +2963,7 @@ impl GreenViewerApp {
         for frame in cached_frames {
             self.merge_colliding_shape_groups(frame);
         }
+        self.sync_shape_series_metadata();
         self.status = format!(
             "Automatically added {} pivot(s) from closed shapes in sequence frame 1.",
             created.len()
@@ -2276,6 +3090,7 @@ impl GreenViewerApp {
             matched_centroids,
             observations,
             enabled: true,
+            auto_created: false,
         });
         self.rebuild_shape_track_from_cached_masks(track_id);
         let cached_frames = self.sequence_mask_cache.keys().copied().collect::<Vec<_>>();
@@ -2283,6 +3098,10 @@ impl GreenViewerApp {
             self.merge_colliding_shape_groups(frame);
         }
         self.shape_plot_open = true;
+        if let Some(plot) = self.plot_windows.first_mut() {
+            plot.open = true;
+        }
+        self.sync_shape_series_metadata();
         let samples = self
             .shape_tracks
             .iter()
@@ -2363,6 +3182,191 @@ time: {}", format_absolute_time(timestamp)));
                 }
             })
             .collect()
+    }
+
+    fn delete_current_sequence_frame(&mut self) {
+        if self.source_loading
+            || self.processing
+            || self.pending_capture.is_some()
+            || self.processing_capture.is_some()
+        {
+            self.error = Some(
+                "Wait for the current load/capture/processing job to finish before deleting a frame."
+                    .to_owned(),
+            );
+            return;
+        }
+
+        let Some((root, frame_index, frame_path)) = self.active_sequence.as_ref().and_then(|sequence| {
+            sequence
+                .frames
+                .get(sequence.selected)
+                .map(|frame| (sequence.root.clone(), sequence.selected, frame.path.clone()))
+        }) else {
+            self.error = Some("There is no current sequence frame to delete.".to_owned());
+            return;
+        };
+
+        self.sequence_playing = false;
+        self.next_sequence_frame_due = None;
+
+        if let Err(error) = std::fs::remove_file(&frame_path) {
+            self.error = Some(format!(
+                "Failed to delete current frame {}: {error}",
+                frame_path.display()
+            ));
+            return;
+        }
+
+        // Captured sequences normally use the same filename in original/ and processed/.
+        // Remove the counterpart as well so deleting one timeline frame cannot leave a stale
+        // processed image behind. Missing counterparts are harmless.
+        let mut cleanup_warnings = Vec::new();
+        if let Some(file_name) = frame_path.file_name() {
+            for candidate in [root.join("original").join(file_name), root.join("processed").join(file_name)] {
+                if candidate != frame_path && candidate.is_file() {
+                    if let Err(error) = std::fs::remove_file(&candidate) {
+                        cleanup_warnings.push(format!("{}: {error}", candidate.display()));
+                    }
+                }
+            }
+        }
+
+        let (next_path, manifest_error) = {
+            let Some(sequence) = self.active_sequence.as_mut() else {
+                return;
+            };
+            if frame_index >= sequence.frames.len() {
+                self.error = Some("The selected frame changed before deletion completed.".to_owned());
+                return;
+            }
+            sequence.frames.remove(frame_index);
+            if sequence.frames.is_empty() {
+                sequence.selected = 0;
+            } else {
+                sequence.selected = frame_index.min(sequence.frames.len() - 1);
+            }
+            let next_path = sequence
+                .frames
+                .get(sequence.selected)
+                .map(|frame| frame.path.clone());
+            let manifest_error = write_sequence_manifest(sequence).err();
+            (next_path, manifest_error)
+        };
+
+        remove_and_shift_index_map(&mut self.sequence_mask_cache, frame_index);
+        remove_and_shift_index_map(&mut self.sequence_raw_mask_cache, frame_index);
+        let old_order = std::mem::take(&mut self.sequence_mask_cache_order);
+        let mut new_order = VecDeque::new();
+        for index in old_order {
+            if index == frame_index {
+                continue;
+            }
+            let shifted = if index > frame_index { index - 1 } else { index };
+            if !new_order.contains(&shifted) {
+                new_order.push_back(shifted);
+            }
+        }
+        self.sequence_mask_cache_order = new_order;
+
+        let frame_dimensions = self
+            .sequence_mask_cache
+            .iter()
+            .map(|(&index, cached)| (index, (cached.width, cached.height)))
+            .chain(
+                self.sequence_raw_mask_cache
+                    .iter()
+                    .map(|(&index, cached)| (index, (cached.width, cached.height))),
+            )
+            .collect::<BTreeMap<_, _>>();
+
+        let mut tracks_without_anchor = BTreeSet::new();
+        for track in &mut self.shape_tracks {
+            remove_and_shift_index_map(&mut track.matched_pixels, frame_index);
+            remove_and_shift_index_map(&mut track.matched_centroids, frame_index);
+            remove_and_shift_index_map(&mut track.observations, frame_index);
+
+            if track.anchor_frame > frame_index {
+                track.anchor_frame -= 1;
+            } else if track.anchor_frame == frame_index {
+                let replacement = track
+                    .matched_pixels
+                    .keys()
+                    .copied()
+                    .min_by_key(|candidate| candidate.abs_diff(frame_index))
+                    .and_then(|new_anchor| {
+                        let pixels = track.matched_pixels.get(&new_anchor)?.clone();
+                        let centroid = track.matched_centroids.get(&new_anchor).copied()?;
+                        Some((new_anchor, pixels, centroid))
+                    });
+                if let Some((new_anchor, pixels, centroid)) = replacement {
+                    track.anchor_frame = new_anchor;
+                    track.anchor_pixels = pixels;
+                    track.anchor_pivot = centroid;
+                    if let Some(&(width, height)) = frame_dimensions.get(&new_anchor) {
+                        track.anchor_width = width;
+                        track.anchor_height = height;
+                    }
+                } else {
+                    tracks_without_anchor.insert(track.id);
+                }
+            }
+        }
+        if !tracks_without_anchor.is_empty() {
+            self.shape_tracks
+                .retain(|track| !tracks_without_anchor.contains(&track.id));
+        }
+
+        self.auto_track_highwater_frame = self.auto_track_highwater_frame.and_then(|index| {
+            if index > frame_index {
+                Some(index - 1)
+            } else if index == frame_index {
+                index.checked_sub(1)
+            } else {
+                Some(index)
+            }
+        });
+        self.active_processing_sequence_frame = self.active_processing_sequence_frame.and_then(|index| {
+            if index > frame_index {
+                Some(index - 1)
+            } else if index == frame_index {
+                None
+            } else {
+                Some(index)
+            }
+        });
+
+        self.current_final_mask = None;
+        self.ai_mask = None;
+        self.ai_mask_rgba = None;
+        self.ai_mask_texture = None;
+        self.sync_shape_series_metadata();
+        self.auto_seed_pivots_pending = self
+            .active_sequence
+            .as_ref()
+            .is_some_and(|sequence| !sequence.frames.is_empty() && self.shape_tracks.is_empty());
+
+        let mut status = format!("Deleted frame {} from {}", frame_index + 1, root.display());
+        if let Some(error) = manifest_error {
+            status.push_str(&format!("; warning: failed to update sequence.json: {error:#}"));
+        }
+        if !cleanup_warnings.is_empty() {
+            status.push_str(&format!("; counterpart cleanup warning: {}", cleanup_warnings.join(" | ")));
+        }
+        self.status = status;
+        self.error = None;
+
+        if let Some(path) = next_path {
+            self.queue_source(SourceRequest::SequenceFrame(path));
+        } else {
+            self.original_rgba = None;
+            self.original_gray = None;
+            self.original_texture = None;
+            self.processed_rgba = None;
+            self.processed_texture = None;
+            self.source_label = "Sequence is empty".to_owned();
+        }
+        self.save_preferences();
     }
 
     fn step_sequence(&mut self, delta: isize) {
@@ -2474,6 +3478,10 @@ time: {}", format_absolute_time(timestamp)));
             self.sequence_timeline(ui);
             self.sequence_analysis_controls(ui);
         }
+
+        ui.separator();
+        self.timeseries_controls(ui);
+        self.home_assistant_controls(ui);
 
         ui.separator();
         ui.collapsing("Status", |ui| {
@@ -3032,6 +4040,7 @@ time: {}", format_absolute_time(timestamp)));
         if changed {
             self.dirty = true;
             self.sequence_mask_cache.clear();
+            self.sequence_raw_mask_cache.clear();
             self.sequence_mask_cache_order.clear();
             self.save_preferences();
         }
@@ -3074,6 +4083,7 @@ time: {}", format_absolute_time(timestamp)));
 
         let mut selected_path = None;
         let mut step_delta = 0isize;
+        let mut delete_current = false;
 
         ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
@@ -3089,6 +4099,22 @@ time: {}", format_absolute_time(timestamp)));
                 }
                 if ui.button("Next").on_hover_text("Next frame").clicked() {
                     step_delta = 1;
+                    self.sequence_playing = false;
+                }
+                let can_delete = self
+                    .active_sequence
+                    .as_ref()
+                    .is_some_and(|sequence| !sequence.frames.is_empty())
+                    && !self.source_loading
+                    && !self.processing
+                    && self.pending_capture.is_none()
+                    && self.processing_capture.is_none();
+                if ui
+                    .add_enabled(can_delete, egui::Button::new("Delete current frame"))
+                    .on_hover_text("Delete the current sequence frame from disk, its processed counterpart if present, and sequence.json")
+                    .clicked()
+                {
+                    delete_current = true;
                     self.sequence_playing = false;
                 }
             });
@@ -3141,11 +4167,239 @@ time: {}", format_absolute_time(timestamp)));
             }
         });
 
-        if step_delta != 0 {
+        if delete_current {
+            self.delete_current_sequence_frame();
+        } else if step_delta != 0 {
             self.step_sequence(step_delta);
         } else if let Some(path) = selected_path {
             self.queue_source(SourceRequest::SequenceFrame(path));
         }
+    }
+
+    fn timeseries_controls(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Timeseries / plot windows", |ui| {
+            ui.small("Every tracked shape area and Home Assistant sensor is a timeseries. Rename it, assign a logical group, and move either one series or a whole group between plot windows.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("New plot window").clicked() {
+                    self.spawn_plot_window();
+                }
+                if ui.button("Open all plots").clicked() {
+                    for plot in &mut self.plot_windows {
+                        plot.open = true;
+                    }
+                }
+                ui.small("Processed view: Shift+drag a rectangle around pivots to assign those shape timeseries to one new group.");
+            });
+
+            ui.separator();
+            ui.label("Plot windows");
+            let mut remove_plot = None;
+            let can_remove_plot = self.plot_windows.len() > 1;
+            for (index, plot) in self.plot_windows.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut plot.open, "");
+                    ui.monospace(format!("P{}", plot.id));
+                    ui.add(egui::TextEdit::singleline(&mut plot.title).desired_width(220.0));
+                    if can_remove_plot && ui.small_button("×").clicked() {
+                        remove_plot = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove_plot {
+                let removed_id = self.plot_windows[index].id;
+                self.plot_windows.remove(index);
+                let fallback = self.default_plot_id();
+                for meta in self.series_meta.values_mut() {
+                    if meta.plot_id == removed_id {
+                        meta.plot_id = fallback;
+                    }
+                }
+                self.save_preferences();
+            }
+
+            self.sync_shape_series_metadata();
+            self.sync_home_assistant_series_metadata();
+            let plot_options = self
+                .plot_windows
+                .iter()
+                .map(|plot| (plot.id, plot.title.clone()))
+                .collect::<Vec<_>>();
+
+            if !self.series_meta.is_empty() {
+                ui.separator();
+                ui.label("Series");
+                let keys = self.series_meta.keys().cloned().collect::<Vec<_>>();
+                for key in keys {
+                    let color = series_color(stable_series_seed(&key));
+                    if let Some(meta) = self.series_meta.get_mut(&key) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut meta.visible, "");
+                            ui.colored_label(color, "●");
+                            ui.add(egui::TextEdit::singleline(&mut meta.name).desired_width(170.0));
+                            ui.label("group");
+                            ui.add(egui::TextEdit::singleline(&mut meta.group).desired_width(130.0));
+                            let selected = plot_options
+                                .iter()
+                                .find(|(id, _)| *id == meta.plot_id)
+                                .map(|(_, title)| title.as_str())
+                                .unwrap_or("plot");
+                            egui::ComboBox::from_id_salt(("series-plot", key.clone()))
+                                .selected_text(selected)
+                                .show_ui(ui, |ui| {
+                                    for (plot_id, title) in &plot_options {
+                                        ui.selectable_value(&mut meta.plot_id, *plot_id, title);
+                                    }
+                                });
+                            ui.monospace(&key);
+                        });
+                    }
+                }
+
+                ui.separator();
+                ui.label("Move whole group");
+                let groups = self
+                    .series_meta
+                    .values()
+                    .map(|meta| meta.group.clone())
+                    .filter(|group| !group.trim().is_empty())
+                    .collect::<BTreeSet<_>>();
+                for group_name in groups {
+                    let mut targets = self
+                        .series_meta
+                        .values()
+                        .filter(|meta| meta.group == group_name)
+                        .map(|meta| meta.plot_id);
+                    let Some(first_target) = targets.next() else { continue; };
+                    let rest = targets.collect::<Vec<_>>();
+                    let member_count = rest.len() + 1;
+                    let mixed = rest.iter().any(|target| *target != first_target);
+                    let mut target = if mixed { 0 } else { first_target };
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{} ({} series)", group_name, member_count));
+                        let selected = if target == 0 {
+                            "mixed"
+                        } else {
+                            plot_options
+                                .iter()
+                                .find(|(id, _)| *id == target)
+                                .map(|(_, title)| title.as_str())
+                                .unwrap_or("plot")
+                        };
+                        egui::ComboBox::from_id_salt(("group-plot", group_name.clone()))
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for (plot_id, title) in &plot_options {
+                                    ui.selectable_value(&mut target, *plot_id, title);
+                                }
+                            });
+                    });
+                    if target != 0 && (mixed || target != first_target) {
+                        for meta in self.series_meta.values_mut().filter(|meta| meta.group == group_name) {
+                            meta.plot_id = target;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn home_assistant_controls(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Home Assistant / FlowerCare timeseries", |ui| {
+            ui.small("Uses Home Assistant REST API. FlowerCare usually exposes temperature, moisture, conductivity, illuminance and battery as separate sensor.* entities; add each entity here. Leave attribute blank to plot the entity state.");
+            ui.label("Home Assistant URL");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ha_base_url_input)
+                    .hint_text("http://homeassistant.local:8123")
+                    .desired_width(430.0),
+            );
+            ui.label("Long-Lived Access Token");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ha_token_input)
+                    .password(true)
+                    .desired_width(430.0),
+            );
+            ui.checkbox(&mut self.ha_remember_token, "Remember token in local state.json");
+            ui.horizontal_wrapped(|ui| {
+                if ui.checkbox(&mut self.ha_auto_poll, "Auto poll").changed() {
+                    self.next_ha_poll = self.ha_auto_poll.then(Instant::now);
+                }
+                ui.add(
+                    egui::DragValue::new(&mut self.ha_poll_interval_secs)
+                        .range(1.0..=86_400.0)
+                        .speed(1.0)
+                        .suffix(" s"),
+                );
+                if ui
+                    .add_enabled(!self.ha_request_pending, egui::Button::new("Fetch now"))
+                    .clicked()
+                {
+                    self.queue_home_assistant_request(HaRequestKind::Snapshot);
+                }
+                ui.label("Backfill");
+                ui.add(
+                    egui::DragValue::new(&mut self.ha_history_hours)
+                        .range(0.1..=8760.0)
+                        .speed(1.0)
+                        .suffix(" h"),
+                );
+                if ui
+                    .add_enabled(!self.ha_request_pending, egui::Button::new("Load history"))
+                    .clicked()
+                {
+                    let end = SystemTime::now();
+                    let start = end
+                        .checked_sub(Duration::from_secs_f64((self.ha_history_hours.max(0.1) as f64) * 3600.0))
+                        .unwrap_or(UNIX_EPOCH);
+                    self.queue_home_assistant_request(HaRequestKind::History { start, end });
+                }
+            });
+            ui.small(&self.ha_status);
+
+            ui.separator();
+            ui.label("Add sensor");
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.ha_entity_id_input)
+                        .hint_text("sensor.flowercare_moisture")
+                        .desired_width(270.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.ha_attribute_input)
+                        .hint_text("attribute (optional)")
+                        .desired_width(180.0),
+                );
+                if ui.button("Add").clicked() {
+                    self.add_home_assistant_series();
+                }
+            });
+
+            let mut remove = None;
+            for (index, config) in self.ha_series.iter().enumerate() {
+                let sample_info = self.ha_data.get(&config.key).map(|data| {
+                    if data.unit.is_empty() {
+                        format!("{} samples", data.points.len())
+                    } else {
+                        format!("{} samples · {}", data.points.len(), data.unit)
+                    }
+                }).unwrap_or_else(|| "0 samples".to_owned());
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(&config.entity_id);
+                    if !config.attribute.trim().is_empty() {
+                        ui.monospace(format!(".{}", config.attribute));
+                    }
+                    ui.small(sample_info);
+                    if ui.small_button("×").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove {
+                let config = self.ha_series.remove(index);
+                self.ha_data.remove(&config.key);
+                self.series_meta.remove(&config.key);
+                self.save_preferences();
+            }
+        });
     }
 
     fn sequence_analysis_controls(&mut self, ui: &mut egui::Ui) {
@@ -3170,6 +4424,7 @@ time: {}", format_absolute_time(timestamp)));
                 for frame in cached_frames {
                     self.merge_colliding_shape_groups(frame);
                 }
+                self.sync_shape_series_metadata();
                 self.save_preferences();
             }
             ui.small("Frame 1 seeds closed components automatically. P remains available for manual add/remove: the clicked pixel + frame become an immutable identity anchor; hover an existing pivot (yellow) and press P to remove it.");
@@ -3253,12 +4508,16 @@ time: {}", format_absolute_time(timestamp)));
                     .clicked()
                 {
                     self.shape_plot_open = true;
+                    if let Some(plot) = self.plot_windows.first_mut() {
+                        plot.open = true;
+                    }
                 }
                 if ui
                     .add_enabled(!self.shape_tracks.is_empty(), egui::Button::new("Clear tracks"))
                     .clicked()
                 {
                     self.shape_tracks.clear();
+                    self.sync_shape_series_metadata();
                 }
             });
             let mut group_counts = BTreeMap::<u64, usize>::new();
@@ -3293,6 +4552,7 @@ time: {}", format_absolute_time(timestamp)));
             }
             if let Some(index) = remove_track {
                 self.shape_tracks.remove(index);
+                self.sync_shape_series_metadata();
             }
         });
     }
@@ -3324,11 +4584,15 @@ time: {}", format_absolute_time(timestamp)));
             &mut self.processed_view,
             egui::pos2(900.0, 100.0),
         );
+        if !processed_interaction.selected_overlay_ids.is_empty() {
+            self.group_selected_shape_series(&processed_interaction.selected_overlay_ids);
+        }
         if let Some(group_id) = processed_interaction.toggle_overlay_id {
             let before = self.shape_tracks.len();
             self.shape_tracks.retain(|track| track.group_id != group_id);
             let removed = before.saturating_sub(self.shape_tracks.len());
             if removed > 0 {
+                self.sync_shape_series_metadata();
                 self.status = if removed == 1 {
                     format!("Removed tracked pivot T{group_id}.")
                 } else {
@@ -3354,19 +4618,10 @@ time: {}", format_absolute_time(timestamp)));
         );
     }
 
-    fn shape_size_plot_window(&mut self, ctx: &egui::Context) {
-        if !self.shape_plot_open || self.shape_tracks.is_empty() {
+    fn timeseries_plot_windows(&mut self, ctx: &egui::Context) {
+        if self.plot_windows.is_empty() {
             return;
         }
-
-        let mut open = self.shape_plot_open;
-        let mut seek_frame = None;
-        let image_width = self
-            .original_rgba
-            .as_ref()
-            .map(|image| image.width() as usize)
-            .unwrap_or(0);
-        let groups = build_shape_group_series(&self.shape_tracks, image_width);
         let sequence_times = self
             .active_sequence
             .as_ref()
@@ -3374,396 +4629,368 @@ time: {}", format_absolute_time(timestamp)));
             .unwrap_or_default();
         let selected_frame = self.active_sequence.as_ref().map(|sequence| sequence.selected);
         let click_seek_enabled = self.plot_click_seek_enabled;
-        let fallback_size = self.shape_plot_window_size;
+        let mut pending_seek = None;
 
-        // Work on locals while the egui Window borrows UI state, then commit at
-        // the end. X/Y navigation is normalized to the whole sequence/data range.
-        let mut plot_x_center = self.plot_x_center.clamp(0.0, 1.0);
-        let mut plot_x_zoom = self.plot_x_zoom.clamp(1.0, 10_000.0);
-        let mut plot_y_center = self.plot_y_center.clamp(0.0, 1.0);
-        let mut plot_y_zoom = self.plot_y_zoom.clamp(1.0, 10_000.0);
+        for index in 0..self.plot_windows.len() {
+            let plot_id = self.plot_windows[index].id;
+            if !self.plot_windows[index].open {
+                continue;
+            }
+            let series = self.collect_plot_series_for_plot(plot_id);
+            let mut open = self.plot_windows[index].open;
+            let title = self.plot_windows[index].title.clone();
+            let pos = self.plot_windows[index].pos;
+            let size = self.plot_windows[index].size;
+            let mut x_center = self.plot_windows[index].x_center.clamp(0.0, 1.0);
+            let mut x_zoom = self.plot_windows[index].x_zoom.clamp(1.0, 10_000.0);
+            let mut y_center = self.plot_windows[index].y_center.clamp(0.0, 1.0);
+            let mut y_zoom = self.plot_windows[index].y_zoom.clamp(1.0, 10_000.0);
+            let mut local_seek = None;
 
-        let response = egui::Window::new("Tracked mask size")
-            .id(egui::Id::new("tracked-mask-size-window"))
-            .open(&mut open)
-            .default_pos(self.shape_plot_window_pos)
-            .default_size(self.shape_plot_window_size)
-            .current_pos(self.shape_plot_window_pos)
-            .min_size(egui::vec2(160.0, 58.0))
-            .constrain(false)
-            .resizable([true, true])
-            .show(ctx, |ui| {
-                ui.set_min_size(egui::Vec2::ZERO);
-                let initial_h = ui.available_height();
-                let body_h = if initial_h.is_finite() {
-                    initial_h
-                } else {
-                    (fallback_size.y - 34.0).max(48.0)
-                };
-
-                if body_h > 150.0 {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.small("Trackpad: horizontal/vertical scroll = pan X/Y · Ctrl+horizontal/vertical = zoom X/Y");
-                        if ui.small_button("Reset plot view").clicked() {
-                            plot_x_center = 0.5;
-                            plot_x_zoom = 1.0;
-                            plot_y_center = 0.5;
-                            plot_y_zoom = 1.0;
-                        }
-                    });
-                }
-                if body_h > 112.0 {
-                    egui::ScrollArea::horizontal()
-                        .id_salt("shape-plot-legend")
-                        .max_height(22.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for group in &groups {
-                                    let last = group.areas.last_key_value();
-                                    let suffix = last
-                                        .map(|(_, area)| format!("{} px", area))
-                                        .unwrap_or_else(|| "no samples".to_owned());
-                                    let prefix = if group.member_count > 1 { "G" } else { "T" };
-                                    ui.colored_label(
-                                        track_color(group.id),
-                                        format!("{}{} {} [{}]", prefix, group.id, group.name, suffix),
-                                    );
-                                    ui.separator();
-                                }
-                            });
+            let response = egui::Window::new(title.clone())
+                .id(egui::Id::new(("timeseries-plot-window", plot_id)))
+                .open(&mut open)
+                .default_pos(pos)
+                .default_size(size)
+                .current_pos(pos)
+                .min_size(egui::vec2(160.0, 58.0))
+                .constrain(false)
+                .resizable([true, true])
+                .show(ctx, |ui| {
+                    ui.set_min_size(egui::Vec2::ZERO);
+                    let available_h = ui.available_height();
+                    if available_h > 130.0 {
+                        ui.horizontal(|ui| {
+                            ui.small("scroll X/Y = pan · Ctrl+scroll X/Y = zoom · hover = value");
+                            if ui.small_button("Reset view").clicked() {
+                                x_center = 0.5;
+                                x_zoom = 1.0;
+                                y_center = 0.5;
+                                y_zoom = 1.0;
+                            }
                         });
-                }
+                    }
+                    if available_h > 92.0 && !series.is_empty() {
+                        egui::ScrollArea::horizontal()
+                            .id_salt(("plot-legend", plot_id))
+                            .max_height(22.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for item in &series {
+                                        let suffix = item
+                                            .points
+                                            .last()
+                                            .map(|point| format_plot_value(point.value, &item.unit))
+                                            .unwrap_or_else(|| "no samples".to_owned());
+                                        ui.colored_label(
+                                            series_color(item.color_seed),
+                                            format!("{} / {} [{}]", item.group, item.name, suffix),
+                                        );
+                                        ui.separator();
+                                    }
+                                });
+                            });
+                    }
 
-                let available = ui.available_size();
-                let plot_width = if available.x.is_finite() {
-                    available.x.max(120.0)
-                } else {
-                    fallback_size.x.max(220.0) - 12.0
-                };
-                let plot_height = if available.y.is_finite() {
-                    available.y.max(12.0)
-                } else {
-                    (fallback_size.y - 70.0).max(12.0)
-                };
-                let sense = if click_seek_enabled {
-                    egui::Sense::click()
-                } else {
-                    egui::Sense::hover()
-                };
-                let (plot_response, painter) =
-                    ui.allocate_painter(egui::vec2(plot_width, plot_height), sense);
+                    if series.is_empty() {
+                        ui.centered_and_justified(|ui| {
+                            ui.monospace("No timeseries assigned to this plot yet.");
+                        });
+                        return;
+                    }
 
-                let horizontal_margin = if plot_width > 260.0 { 52.0 } else if plot_width > 150.0 { 24.0 } else { 4.0 };
-                let vertical_margin = if plot_height > 95.0 { 27.0 } else if plot_height > 40.0 { 10.0 } else { 1.0 };
-                let rect = plot_response
-                    .rect
-                    .shrink2(egui::vec2(horizontal_margin, vertical_margin));
-                if rect.width() <= 2.0 || rect.height() <= 2.0 {
-                    return;
-                }
+                    let available = ui.available_size();
+                    let plot_width = if available.x.is_finite() { available.x.max(120.0) } else { size.x.max(220.0) - 12.0 };
+                    let plot_height = if available.y.is_finite() { available.y.max(12.0) } else { (size.y - 50.0).max(12.0) };
+                    let sense = if click_seek_enabled { egui::Sense::click() } else { egui::Sense::hover() };
+                    let (plot_response, painter) = ui.allocate_painter(egui::vec2(plot_width, plot_height), sense);
+                    let horizontal_margin = if plot_width > 260.0 { 58.0 } else if plot_width > 150.0 { 26.0 } else { 4.0 };
+                    let vertical_margin = if plot_height > 95.0 { 28.0 } else if plot_height > 40.0 { 10.0 } else { 1.0 };
+                    let rect = plot_response.rect.shrink2(egui::vec2(horizontal_margin, vertical_margin));
+                    if rect.width() <= 2.0 || rect.height() <= 2.0 {
+                        return;
+                    }
 
-                let max_area = groups
-                    .iter()
-                    .flat_map(|group| group.areas.values().copied())
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
+                    let mut start_time = None::<SystemTime>;
+                    let mut end_time = None::<SystemTime>;
+                    let mut data_min = f64::INFINITY;
+                    let mut data_max = f64::NEG_INFINITY;
+                    let shape_only = series.iter().all(|item| item.unit == "px");
+                    for item in &series {
+                        for point in &item.points {
+                            start_time = Some(start_time.map_or(point.time, |current| current.min(point.time)));
+                            end_time = Some(end_time.map_or(point.time, |current| current.max(point.time)));
+                            data_min = data_min.min(point.value);
+                            data_max = data_max.max(point.value);
+                        }
+                    }
+                    let (start_time, end_time) = match (start_time, end_time) {
+                        (Some(start), Some(end)) => (start, end),
+                        _ => return,
+                    };
+                    let full_span = end_time
+                        .duration_since(start_time)
+                        .unwrap_or(Duration::from_secs(1))
+                        .max(Duration::from_millis(1));
+                    if shape_only && data_min >= 0.0 {
+                        data_min = 0.0;
+                    }
+                    if !data_min.is_finite() || !data_max.is_finite() {
+                        return;
+                    }
+                    if (data_max - data_min).abs() < 1e-9 {
+                        let delta = data_max.abs().max(1.0) * 0.1;
+                        data_min -= delta;
+                        data_max += delta;
+                    } else {
+                        let padding = (data_max - data_min) * 0.05;
+                        data_min -= padding;
+                        data_max += padding;
+                    }
+                    let data_span = (data_max - data_min).max(1e-9);
 
-                let (start_time, end_time) = match (sequence_times.first(), sequence_times.last()) {
-                    (Some(start), Some(end)) => (*start, *end),
-                    _ => (UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(1)),
-                };
-                let full_span = end_time
-                    .duration_since(start_time)
-                    .unwrap_or(Duration::from_secs(1))
-                    .max(Duration::from_millis(1));
+                    if plot_response.contains_pointer() {
+                        let mut pan_scroll = egui::Vec2::ZERO;
+                        let mut zoom_scroll = egui::Vec2::ZERO;
+                        ui.input(|input| {
+                            for event in &input.events {
+                                if let egui::Event::MouseWheel { unit, delta, modifiers, .. } = event {
+                                    let scale = match unit {
+                                        egui::MouseWheelUnit::Point => 1.0,
+                                        egui::MouseWheelUnit::Line => 24.0,
+                                        egui::MouseWheelUnit::Page => 180.0,
+                                    };
+                                    if modifiers.ctrl {
+                                        zoom_scroll += *delta * scale;
+                                    } else {
+                                        pan_scroll += *delta * scale;
+                                    }
+                                }
+                            }
+                        });
+                        let pointer = plot_response.hover_pos().unwrap_or_else(|| rect.center());
+                        let anchor_x = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+                        let anchor_y = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
+                        if pan_scroll.x.abs() > f32::EPSILON {
+                            let visible = 1.0 / x_zoom as f64;
+                            x_center -= pan_scroll.x as f64 / rect.width() as f64 * visible;
+                        }
+                        if pan_scroll.y.abs() > f32::EPSILON {
+                            let visible = 1.0 / y_zoom;
+                            y_center += pan_scroll.y / rect.height() * visible;
+                        }
+                        if zoom_scroll.x.abs() > f32::EPSILON {
+                            let old_visible = 1.0 / x_zoom as f64;
+                            let old_min = x_center - old_visible * 0.5;
+                            let anchor_value = old_min + anchor_x * old_visible;
+                            x_zoom = (x_zoom * (zoom_scroll.x * 0.0025).exp()).clamp(1.0, 10_000.0);
+                            let new_visible = 1.0 / x_zoom as f64;
+                            x_center = anchor_value + (0.5 - anchor_x) * new_visible;
+                        }
+                        if zoom_scroll.y.abs() > f32::EPSILON {
+                            let old_visible = 1.0 / y_zoom;
+                            let old_min = y_center - old_visible * 0.5;
+                            let anchor_value = old_min + anchor_y * old_visible;
+                            y_zoom = (y_zoom * (zoom_scroll.y * 0.0025).exp()).clamp(1.0, 10_000.0);
+                            let new_visible = 1.0 / y_zoom;
+                            y_center = anchor_value + (0.5 - anchor_y) * new_visible;
+                        }
+                        let x_half = 0.5 / x_zoom as f64;
+                        x_center = x_center.clamp(x_half, 1.0 - x_half);
+                        let y_half = 0.5 / y_zoom;
+                        y_center = y_center.clamp(y_half, 1.0 - y_half);
+                    }
 
-                // Raw wheel events preserve independent X/Y deltas even when Ctrl
-                // is held. That is important for two-axis trackpad navigation.
-                if plot_response.contains_pointer() {
-                    let mut pan_scroll = egui::Vec2::ZERO;
-                    let mut zoom_scroll = egui::Vec2::ZERO;
-                    ui.input(|input| {
-                        for event in &input.events {
-                            if let egui::Event::MouseWheel {
-                                unit,
-                                delta,
-                                modifiers,
-                                ..
-                            } = event
-                            {
-                                let scale = match unit {
-                                    egui::MouseWheelUnit::Point => 1.0,
-                                    egui::MouseWheelUnit::Line => 24.0,
-                                    egui::MouseWheelUnit::Page => 180.0,
-                                };
-                                if modifiers.ctrl {
-                                    zoom_scroll += *delta * scale;
-                                } else {
-                                    pan_scroll += *delta * scale;
+                    let x_visible = 1.0 / x_zoom as f64;
+                    let x_min = (x_center - x_visible * 0.5).clamp(0.0, 1.0 - x_visible);
+                    let x_max = x_min + x_visible;
+                    let y_visible = 1.0 / y_zoom;
+                    let y_min_norm = (y_center - y_visible * 0.5).clamp(0.0, 1.0 - y_visible);
+                    let y_max_norm = y_min_norm + y_visible;
+                    let visible_span = Duration::from_secs_f64((full_span.as_secs_f64() * x_visible).max(0.001));
+
+                    let x_for_time = |time: SystemTime| -> Option<f32> {
+                        let offset = time.duration_since(start_time).ok()?;
+                        let norm = (offset.as_secs_f64() / full_span.as_secs_f64()).clamp(0.0, 1.0);
+                        Some(rect.left() + ((norm - x_min) / (x_max - x_min)) as f32 * rect.width())
+                    };
+                    let y_for_value = |value: f64| -> f32 {
+                        let norm = ((value - data_min) / data_span) as f32;
+                        rect.bottom() - ((norm - y_min_norm) / (y_max_norm - y_min_norm)) * rect.height()
+                    };
+
+                    let border = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
+                    painter.rect_stroke(rect, 0.0, border, egui::StrokeKind::Inside);
+                    let grid_steps = if rect.height() > 85.0 { 4 } else { 2 };
+                    for step in 0..=grid_steps {
+                        let t = step as f32 / grid_steps.max(1) as f32;
+                        let y = egui::lerp(rect.bottom()..=rect.top(), t);
+                        painter.line_segment(
+                            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                            egui::Stroke::new(0.5, egui::Color32::from_gray(45)),
+                        );
+                        if rect.height() > 55.0 {
+                            let value_norm = y_min_norm + (y_max_norm - y_min_norm) * t;
+                            let value = data_min + data_span * value_norm as f64;
+                            painter.text(
+                                egui::pos2(rect.left() - 5.0, y),
+                                egui::Align2::RIGHT_CENTER,
+                                format_compact_number(value),
+                                egui::FontId::monospace(9.0),
+                                egui::Color32::GRAY,
+                            );
+                        }
+                    }
+                    let time_steps = if rect.width() > 520.0 { 4 } else if rect.width() > 300.0 { 2 } else { 1 };
+                    for step in 0..=time_steps {
+                        let t = step as f64 / time_steps.max(1) as f64;
+                        let full_fraction = x_min + (x_max - x_min) * t;
+                        let tick_time = start_time + Duration::from_secs_f64(full_span.as_secs_f64() * full_fraction);
+                        let x = egui::lerp(rect.left()..=rect.right(), t as f32);
+                        painter.line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                            egui::Stroke::new(0.5, egui::Color32::from_gray(35)),
+                        );
+                        if rect.width() > 180.0 && plot_height > 48.0 {
+                            painter.text(
+                                egui::pos2(x, rect.bottom() + 5.0),
+                                egui::Align2::CENTER_TOP,
+                                format_plot_axis_time(tick_time, visible_span),
+                                egui::FontId::monospace(9.0),
+                                egui::Color32::GRAY,
+                            );
+                        }
+                    }
+
+                    let data_painter = painter.with_clip_rect(rect);
+                    let plot_hover = plot_response.hover_pos().filter(|pos| rect.contains(*pos));
+                    let mut hovered: Option<(f32, usize, usize, egui::Pos2)> = None;
+                    for (series_index, item) in series.iter().enumerate() {
+                        let color = series_color(item.color_seed);
+                        let mut points = Vec::with_capacity(item.points.len());
+                        for (point_index, point) in item.points.iter().enumerate() {
+                            let Some(x) = x_for_time(point.time) else { continue; };
+                            let y = y_for_value(point.value);
+                            let screen = egui::pos2(x, y);
+                            points.push(screen);
+                            if rect.contains(screen) {
+                                if let Some(pointer) = plot_hover {
+                                    let distance_sq = screen.distance_sq(pointer);
+                                    if distance_sq <= 9.0 * 9.0
+                                        && hovered.as_ref().is_none_or(|current| distance_sq < current.0)
+                                    {
+                                        hovered = Some((distance_sq, series_index, point_index, screen));
+                                    }
                                 }
                             }
                         }
-                    });
-
-                    let pointer = plot_response.hover_pos().unwrap_or_else(|| rect.center());
-                    let anchor_x = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
-                    // Y data grows upward, so the bottom of the plot is 0.0.
-                    let anchor_y = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
-
-                    if pan_scroll.x.abs() > f32::EPSILON {
-                        let visible = 1.0 / plot_x_zoom as f64;
-                        plot_x_center -= pan_scroll.x as f64 / rect.width() as f64 * visible;
-                    }
-                    if pan_scroll.y.abs() > f32::EPSILON {
-                        let visible = 1.0 / plot_y_zoom;
-                        plot_y_center += pan_scroll.y / rect.height() * visible;
-                    }
-
-                    if zoom_scroll.x.abs() > f32::EPSILON {
-                        let old_visible = 1.0 / plot_x_zoom as f64;
-                        let old_start = plot_x_center - old_visible * 0.5;
-                        let anchor_value = old_start + anchor_x * old_visible;
-                        let factor = (zoom_scroll.x as f64 * 0.0075).exp();
-                        plot_x_zoom = (plot_x_zoom as f64 * factor).clamp(1.0, 10_000.0) as f32;
-                        let new_visible = 1.0 / plot_x_zoom as f64;
-                        plot_x_center = anchor_value + (0.5 - anchor_x) * new_visible;
-                    }
-                    if zoom_scroll.y.abs() > f32::EPSILON {
-                        let old_visible = 1.0 / plot_y_zoom;
-                        let old_start = plot_y_center - old_visible * 0.5;
-                        let anchor_value = old_start + anchor_y * old_visible;
-                        let factor = (zoom_scroll.y * 0.0075).exp();
-                        plot_y_zoom = (plot_y_zoom * factor).clamp(1.0, 10_000.0);
-                        let new_visible = 1.0 / plot_y_zoom;
-                        plot_y_center = anchor_value + (0.5 - anchor_y) * new_visible;
-                    }
-
-                    let x_half = 0.5 / plot_x_zoom as f64;
-                    plot_x_center = plot_x_center.clamp(x_half, 1.0 - x_half);
-                    let y_half = 0.5 / plot_y_zoom;
-                    plot_y_center = plot_y_center.clamp(y_half, 1.0 - y_half);
-                }
-
-                let x_visible = 1.0 / plot_x_zoom as f64;
-                let x_min = (plot_x_center - x_visible * 0.5).clamp(0.0, 1.0 - x_visible);
-                let x_max = x_min + x_visible;
-                let visible_span = Duration::from_secs_f64(
-                    (full_span.as_secs_f64() * x_visible).max(0.001),
-                );
-
-                let y_visible = 1.0 / plot_y_zoom;
-                let y_min = (plot_y_center - y_visible * 0.5).clamp(0.0, 1.0 - y_visible);
-                let y_max = y_min + y_visible;
-
-                let x_for_frame = |frame: usize| -> Option<f32> {
-                    let timestamp = *sequence_times.get(frame)?;
-                    let offset = timestamp.duration_since(start_time).ok()?;
-                    let norm = (offset.as_secs_f64() / full_span.as_secs_f64()).clamp(0.0, 1.0);
-                    Some(rect.left() + ((norm - x_min) / (x_max - x_min)) as f32 * rect.width())
-                };
-
-                let y_for_area = |area: usize| -> f32 {
-                    let norm = area as f32 / max_area as f32;
-                    rect.bottom() - ((norm - y_min) / (y_max - y_min)) * rect.height()
-                };
-
-                let border = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
-                painter.line_segment([rect.left_top(), rect.right_top()], border);
-                painter.line_segment([rect.right_top(), rect.right_bottom()], border);
-                painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
-                painter.line_segment([rect.left_bottom(), rect.left_top()], border);
-
-                let grid_steps = if rect.height() > 85.0 { 4 } else { 2 };
-                for step in 0..=grid_steps {
-                    let t = step as f32 / grid_steps.max(1) as f32;
-                    let y = egui::lerp(rect.bottom()..=rect.top(), t);
-                    painter.line_segment(
-                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                        egui::Stroke::new(0.5, egui::Color32::from_gray(45)),
-                    );
-                    if rect.height() > 55.0 {
-                        let value_norm = y_min + (y_max - y_min) * t;
-                        painter.text(
-                            egui::pos2(rect.left() - 5.0, y),
-                            egui::Align2::RIGHT_CENTER,
-                            format!("{}", (max_area as f32 * value_norm).round() as usize),
-                            egui::FontId::monospace(9.0),
-                            egui::Color32::GRAY,
-                        );
-                    }
-                }
-
-                let time_steps = if rect.width() > 520.0 { 4 } else if rect.width() > 300.0 { 2 } else { 1 };
-                for step in 0..=time_steps {
-                    let t = step as f64 / time_steps.max(1) as f64;
-                    let full_fraction = x_min + (x_max - x_min) * t;
-                    let tick_time = start_time
-                        + Duration::from_secs_f64(full_span.as_secs_f64() * full_fraction);
-                    let x = egui::lerp(rect.left()..=rect.right(), t as f32);
-                    painter.line_segment(
-                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(0.5, egui::Color32::from_gray(35)),
-                    );
-                    if rect.width() > 180.0 && plot_height > 48.0 {
-                        painter.text(
-                            egui::pos2(x, rect.bottom() + 5.0),
-                            egui::Align2::CENTER_TOP,
-                            format_plot_axis_time(tick_time, visible_span),
-                            egui::FontId::monospace(9.0),
-                            egui::Color32::GRAY,
-                        );
-                    }
-                }
-
-                let data_painter = painter.with_clip_rect(rect);
-                let plot_hover = plot_response.hover_pos().filter(|pos| rect.contains(*pos));
-                let mut hovered_data_point: Option<(f32, u64, usize, usize, egui::Pos2)> = None;
-                for group in &groups {
-                    let color = track_color(group.id);
-                    let mut points = Vec::new();
-                    for (&frame, &area) in &group.areas {
-                        let Some(x) = x_for_frame(frame) else { continue; };
-                        let y = y_for_area(area);
-                        let point = egui::pos2(x, y);
-                        points.push((frame, area, point));
-                        if rect.contains(point)
-                            && let Some(pointer) = plot_hover
-                        {
-                            let distance_sq = point.distance_sq(pointer);
-                            if distance_sq <= 9.0 * 9.0
-                                && hovered_data_point
-                                    .as_ref()
-                                    .is_none_or(|current| distance_sq < current.0)
-                            {
-                                hovered_data_point = Some((distance_sq, group.id, frame, area, point));
-                            }
+                        for pair in points.windows(2) {
+                            data_painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0, color));
+                        }
+                        for point in points {
+                            data_painter.circle_filled(point, 2.8, color);
                         }
                     }
-                    for pair in points.windows(2) {
-                        data_painter.line_segment([pair[0].2, pair[1].2], egui::Stroke::new(2.0, color));
-                    }
-                    for (_, _, point) in points {
-                        data_painter.circle_filled(point, 2.8, color);
-                    }
-                    if let Some(x) = x_for_frame(group.anchor_frame)
-                        && let Some(area) = group.areas.get(&group.anchor_frame)
-                    {
-                        let y = y_for_area(*area);
-                        data_painter.circle_stroke(
-                            egui::pos2(x, y),
-                            5.5,
-                            egui::Stroke::new(1.8, color),
-                        );
-                    }
-                }
 
-                if let Some((_, group_id, frame, area, point)) = hovered_data_point {
-                    data_painter.circle_filled(point, 4.5, egui::Color32::YELLOW);
-                    data_painter.circle_stroke(point, 7.0, egui::Stroke::new(1.2, egui::Color32::YELLOW));
-                    let time_text = sequence_times
-                        .get(frame)
-                        .map(|time| format_absolute_time(*time))
-                        .unwrap_or_else(|| "unknown".to_owned());
-                    let text = format!("G/T {}\nframe: {}\narea: {} px\ntime: {}", group_id, frame + 1, area, time_text);
-                    let tooltip_size = egui::vec2(210.0, 70.0);
-                    let mut tooltip_pos = point + egui::vec2(10.0, 10.0);
-                    if tooltip_pos.x + tooltip_size.x > plot_response.rect.right() {
-                        tooltip_pos.x = point.x - tooltip_size.x - 10.0;
-                    }
-                    if tooltip_pos.y + tooltip_size.y > plot_response.rect.bottom() {
-                        tooltip_pos.y = point.y - tooltip_size.y - 10.0;
-                    }
-                    let tooltip_rect = egui::Rect::from_min_size(tooltip_pos, tooltip_size);
-                    painter.rect_filled(
-                        tooltip_rect,
-                        3.0,
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 230),
-                    );
-                    painter.text(
-                        tooltip_rect.min + egui::vec2(7.0, 6.0),
-                        egui::Align2::LEFT_TOP,
-                        text,
-                        egui::FontId::monospace(10.5),
-                        egui::Color32::YELLOW,
-                    );
-                }
-
-                if let Some(frame_index) = selected_frame
-                    && let Some(x) = x_for_frame(frame_index)
-                    && x >= rect.left()
-                    && x <= rect.right()
-                {
-                    let stroke = egui::Stroke::new(1.4, egui::Color32::WHITE);
-                    let mut y = rect.top();
-                    while y < rect.bottom() {
-                        let y2 = (y + 6.0).min(rect.bottom());
-                        painter.line_segment([egui::pos2(x, y), egui::pos2(x, y2)], stroke);
-                        y += 10.0;
-                    }
-                    if plot_height > 62.0
-                        && let Some(timestamp) = sequence_times.get(frame_index)
-                    {
+                    if let Some((_, series_index, point_index, screen)) = hovered {
+                        let item = &series[series_index];
+                        let point = &item.points[point_index];
+                        data_painter.circle_filled(screen, 4.5, egui::Color32::YELLOW);
+                        data_painter.circle_stroke(screen, 7.0, egui::Stroke::new(1.2, egui::Color32::YELLOW));
+                        let frame_text = point.frame.map(|frame| format!("\nframe: {}", frame + 1)).unwrap_or_default();
+                        let text = format!(
+                            "{}\ngroup: {}\nvalue: {}{}\ntime: {}",
+                            item.name,
+                            item.group,
+                            format_compact_number(point.value),
+                            if item.unit.is_empty() { String::new() } else { format!(" {}", item.unit) },
+                            format_absolute_time(point.time),
+                        ) + &frame_text;
+                        let lines = text.lines().count() as f32;
+                        let tooltip_size = egui::vec2(250.0, lines * 15.0 + 12.0);
+                        let mut tooltip_pos = screen + egui::vec2(10.0, 10.0);
+                        if tooltip_pos.x + tooltip_size.x > plot_response.rect.right() {
+                            tooltip_pos.x = screen.x - tooltip_size.x - 10.0;
+                        }
+                        if tooltip_pos.y + tooltip_size.y > plot_response.rect.bottom() {
+                            tooltip_pos.y = screen.y - tooltip_size.y - 10.0;
+                        }
+                        let tooltip_rect = egui::Rect::from_min_size(tooltip_pos, tooltip_size);
+                        painter.rect_filled(tooltip_rect, 3.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 230));
                         painter.text(
-                            egui::pos2(x, rect.top() - 4.0),
-                            egui::Align2::CENTER_BOTTOM,
-                            format!("F{} {}", frame_index + 1, format_plot_axis_time(*timestamp, visible_span)),
-                            egui::FontId::monospace(9.0),
-                            egui::Color32::WHITE,
+                            tooltip_rect.min + egui::vec2(7.0, 6.0),
+                            egui::Align2::LEFT_TOP,
+                            text,
+                            egui::FontId::monospace(10.5),
+                            egui::Color32::YELLOW,
                         );
                     }
-                }
 
-                if click_seek_enabled {
-                    let axis_hit = egui::Rect::from_min_max(
-                        egui::pos2(rect.left(), (rect.bottom() - 8.0).max(rect.top())),
-                        egui::pos2(rect.right(), plot_response.rect.bottom()),
-                    );
-                    if let Some(pointer) = plot_response.hover_pos()
-                        && axis_hit.contains(pointer)
+                    if let Some(frame_index) = selected_frame
+                        && let Some(timestamp) = sequence_times.get(frame_index)
+                        && let Some(x) = x_for_time(*timestamp)
+                        && x >= rect.left()
+                        && x <= rect.right()
                     {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        let stroke = egui::Stroke::new(1.4, egui::Color32::WHITE);
+                        let mut y = rect.top();
+                        while y < rect.bottom() {
+                            let y2 = (y + 6.0).min(rect.bottom());
+                            painter.line_segment([egui::pos2(x, y), egui::pos2(x, y2)], stroke);
+                            y += 10.0;
+                        }
+                        if plot_height > 62.0 {
+                            painter.text(
+                                egui::pos2(x, rect.top() - 4.0),
+                                egui::Align2::CENTER_BOTTOM,
+                                format!("F{} {}", frame_index + 1, format_plot_axis_time(*timestamp, visible_span)),
+                                egui::FontId::monospace(9.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
                     }
-                    if plot_response.clicked()
-                        && !sequence_times.is_empty()
-                        && let Some(pointer) = plot_response.interact_pointer_pos()
-                        && axis_hit.contains(pointer)
-                    {
-                        let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
-                        let target_norm = x_min + fraction * (x_max - x_min);
-                        let target_offset = full_span.as_secs_f64() * target_norm;
-                        seek_frame = sequence_times
-                            .iter()
-                            .enumerate()
-                            .min_by(|(_, a), (_, b)| {
-                                let a_offset = a
-                                    .duration_since(start_time)
-                                    .unwrap_or_default()
-                                    .as_secs_f64();
-                                let b_offset = b
-                                    .duration_since(start_time)
-                                    .unwrap_or_default()
-                                    .as_secs_f64();
-                                (a_offset - target_offset)
-                                    .abs()
-                                    .total_cmp(&(b_offset - target_offset).abs())
-                            })
-                            .map(|(index, _)| index);
-                    }
-                }
-            });
 
-        if let Some(response) = response {
-            self.shape_plot_window_pos = response.response.rect.min;
-            self.shape_plot_window_size = response.response.rect.size();
+                    if click_seek_enabled && !sequence_times.is_empty() {
+                        let axis_hit = egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), (rect.bottom() - 8.0).max(rect.top())),
+                            egui::pos2(rect.right(), plot_response.rect.bottom()),
+                        );
+                        if let Some(pointer) = plot_response.hover_pos() {
+                            if axis_hit.contains(pointer) {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                        }
+                        if plot_response.clicked()
+                            && let Some(pointer) = plot_response.interact_pointer_pos()
+                            && axis_hit.contains(pointer)
+                        {
+                            let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+                            let target_norm = x_min + fraction * (x_max - x_min);
+                            let target_time = start_time + Duration::from_secs_f64(full_span.as_secs_f64() * target_norm);
+                            local_seek = sequence_times
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, time)| system_time_distance(**time, target_time))
+                                .map(|(frame, _)| frame);
+                        }
+                    }
+                });
+
+            if let Some(response) = response {
+                self.plot_windows[index].pos = response.response.rect.min;
+                self.plot_windows[index].size = response.response.rect.size();
+            }
+            self.plot_windows[index].open = open;
+            self.plot_windows[index].x_center = x_center;
+            self.plot_windows[index].x_zoom = x_zoom;
+            self.plot_windows[index].y_center = y_center;
+            self.plot_windows[index].y_zoom = y_zoom;
+            if local_seek.is_some() {
+                pending_seek = local_seek;
+            }
         }
-        self.shape_plot_open = open;
-        self.plot_x_center = plot_x_center;
-        self.plot_x_zoom = plot_x_zoom;
-        self.plot_y_center = plot_y_center;
-        self.plot_y_zoom = plot_y_zoom;
 
-        if let Some(frame) = seek_frame {
+        if let Some(frame) = pending_seek {
             self.seek_sequence_frame(frame);
         }
     }
@@ -3864,6 +5091,8 @@ impl eframe::App for GreenViewerApp {
         self.poll_source_worker(&ctx);
         self.poll_yolo_worker(&ctx);
         self.poll_processing_worker(&ctx);
+        self.poll_home_assistant_worker();
+        self.tick_home_assistant_poll(&ctx);
         self.tick_continuous_capture(&ctx);
         self.handle_global_shortcuts(&ctx);
         self.tick_sequence_playback(&ctx);
@@ -3891,7 +5120,7 @@ impl eframe::App for GreenViewerApp {
             self.controls_window_size = response.response.rect.size();
         }
 
-        self.shape_size_plot_window(&ctx);
+        self.timeseries_plot_windows(&ctx);
         self.tick_preference_persistence(&ctx);
     }
 }
@@ -3905,7 +5134,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.7.6")
+        .user_agent("rust-edge-gui/0.8.1")
         .build()
         .expect("failed to build HTTP client");
 
@@ -4193,6 +5422,7 @@ fn process_image(
     let Some(mut shape_mask) = shape_mask else {
         return Ok(None);
     };
+    let raw_shape_mask = shape_mask.clone();
     let mut shape_count = shape_count;
 
     if request.temporal_required_frames > 0
@@ -4287,6 +5517,7 @@ fn process_image(
 
     Ok(Some(ProcessingResult {
         processed,
+        raw_shape_mask,
         mask: shape_mask,
         width: width as usize,
         height: height as usize,
@@ -4735,6 +5966,67 @@ fn build_shape_group_series(tracks: &[ShapeTrack], width: usize) -> Vec<ShapeGro
     result
 }
 
+fn shape_series_key(group_id: u64) -> String {
+    format!("shape:{group_id}")
+}
+
+fn parse_shape_series_key(key: &str) -> Option<u64> {
+    key.strip_prefix("shape:")?.parse().ok()
+}
+
+fn ha_series_key(entity_id: &str, attribute: &str) -> String {
+    let attribute = attribute.trim();
+    if attribute.is_empty() || attribute.eq_ignore_ascii_case("state") {
+        format!("ha:{}:state", entity_id.trim())
+    } else {
+        format!("ha:{}:{}", entity_id.trim(), attribute)
+    }
+}
+
+fn stable_series_seed(key: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn series_color(seed: u64) -> egui::Color32 {
+    track_color(seed.max(1))
+}
+
+fn format_compact_number(value: f64) -> String {
+    let abs = value.abs();
+    if abs >= 1_000_000.0 {
+        format!("{:.2}M", value / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.2}k", value / 1_000.0)
+    } else if abs >= 100.0 {
+        format!("{value:.0}")
+    } else if abs >= 10.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+fn format_plot_value(value: f64, unit: &str) -> String {
+    if unit.trim().is_empty() {
+        format_compact_number(value)
+    } else {
+        format!("{} {}", format_compact_number(value), unit)
+    }
+}
+
+fn system_time_distance(a: SystemTime, b: SystemTime) -> Duration {
+    if a >= b {
+        a.duration_since(b).unwrap_or_default()
+    } else {
+        b.duration_since(a).unwrap_or_default()
+    }
+}
+
 fn track_color(id: u64) -> egui::Color32 {
     let colors = [
         egui::Color32::from_rgb(80, 220, 255),
@@ -4898,6 +6190,20 @@ fn is_supported_image_path(path: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn remove_and_shift_index_map<T>(map: &mut BTreeMap<usize, T>, removed_index: usize) {
+    let old = std::mem::take(map);
+    *map = old
+        .into_iter()
+        .filter_map(|(index, value)| {
+            if index == removed_index {
+                None
+            } else {
+                Some((if index > removed_index { index - 1 } else { index }, value))
+            }
+        })
+        .collect();
 }
 
 fn write_sequence_manifest(sequence: &ImageSequence) -> Result<()> {
