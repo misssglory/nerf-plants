@@ -1,6 +1,30 @@
-# rust-edge-gui 0.8.2
+# rust-edge-gui 0.8.6
 
 Rust/egui plant-mask viewer and timeseries dashboard for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, native offline YOLO segmentation, temporal filtering, automatic plant/leaf tracking, multiple resizable plots, and external Home Assistant sensor timeseries.
+
+## What changed in 0.8.6
+
+- Before the real frame HTTP request, capture waits for the selected Wi-Fi UUID to be active, IPv4 to be assigned, and the camera host:port to accept TCP.
+- If the selected capture Wi-Fi is already active, the app performs no network switch at all; it only verifies readiness.
+- Activation and readiness share the same timeout budget.
+- On readiness failure after switching, the previous Wi-Fi is restored before retry cooldown.
+
+## What changed in 0.8.5
+
+- Replaced the free-form capture NetworkManager connection text field with a dropdown of saved Wi-Fi connection profiles.
+- The dropdown shows profile names plus a short UUID; the currently active profile is marked with `●`, other saved profiles with `○`.
+- Added **Refresh** to re-read saved NetworkManager Wi-Fi profiles and the active profile without restarting the app.
+- Kept **Use current** as a shortcut for selecting the active Wi-Fi profile.
+- The selected profile is persisted by canonical UUID, so renaming a profile does not change the stored identity.
+- Existing v0.8.4 settings that stored a connection name are migrated to the corresponding UUID at startup when possible.
+- Capture switching behavior is unchanged: if selected/current UUIDs match, no switch occurs; otherwise the capture worker temporarily activates the selected profile and restores the previous Wi-Fi before cooldown/return.
+
+## What changed in 0.8.3
+
+Sequence analysis is now portable with the sequence folder itself. The app writes `sequence_state.json` next to `sequence.json`. It stores tracked pivots and their per-frame areas, collision-group identity, Home Assistant / FlowerCare numeric samples, timeseries names/groups/visibility/plot assignments, and plot-window layout/view state. Opening the sequence restores that analysis automatically.
+
+Home Assistant credentials are intentionally **not** stored in `sequence_state.json`; URL/token remain app-local. Tracked mask geometry is stored as compressed contiguous pixel-index runs so exact areas/collision identity survive reopening without dumping every mask pixel as a separate JSON number.
+
 
 ## What changed in 0.8.2
 
@@ -322,3 +346,16 @@ The ZIP keeps `ultralytics-inference` with `default-features = false` for a smal
 ## License note
 
 This project now depends on `ultralytics-inference`, which is published under **AGPL-3.0**. If you plan to redistribute this application commercially or under a different licensing model, review the Ultralytics licensing terms before distribution.
+
+### Capture through a dedicated Wi-Fi network
+
+Continuous capture can temporarily switch NetworkManager to a saved Wi-Fi profile before fetching a camera frame. In **Continuous capture**, enable **Switch Wi-Fi for capture** and choose one of the saved NetworkManager Wi-Fi profiles from the dropdown. The application does not store Wi-Fi passwords; configure the connection normally with NetworkManager first.
+
+For every capture attempt the application detects the currently active Wi-Fi profile, resolves the requested capture profile to its canonical UUID, and compares them. If they are already the same, no network operation is performed. Otherwise the source worker runs `nmcli connection up` for the capture profile, fetches the image, then restores the profile that was active before that attempt. This restoration also happens after failed fetches, so Telegram/Home Assistant and the retry cooldown run on the normal network. The next retry switches to the camera network again.
+
+This feature requires NetworkManager and `nmcli`. The **Switch timeout** controls how long `nmcli` may wait for each activation. Use **Refresh** to reload saved/active profiles and **Use current** to select the currently active Wi-Fi profile. The selected profile is persisted by UUID.
+
+
+## Capture network readiness (v0.8.6)
+
+When Wi-Fi switching is enabled, each capture attempt waits for the selected NetworkManager UUID to be active, for IPv4 on its device, and for the camera URL host/port to accept a TCP connection before the first HTTP GET. If the selected profile is already active, no network switch occurs.

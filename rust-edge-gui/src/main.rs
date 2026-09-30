@@ -2,6 +2,7 @@ mod viewer;
 mod yolo;
 mod home_assistant;
 mod telegram;
+mod network_manager;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -23,13 +24,18 @@ use yolo::{
 };
 use home_assistant::{HaMessage, HaRequest, HaRequestKind, HaSeriesRequest, HaWorker};
 use telegram::{load_telegram_config, TelegramConfig, TelegramNotifier};
+use network_manager::{CaptureNetworkRequest, SavedWifiProfile};
 
-const APP_TITLE: &str = "Rust Edge GUI v0.8.2 — Capture Reliability & Telegram Alerts";
+const APP_TITLE: &str = "Rust Edge GUI v0.8.6 — Wi-Fi Readiness Gate";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
 const MAX_EXTERNAL_SERIES_POINTS: usize = 50_000;
 const MAX_STATUS_HISTORY: usize = 250;
+
+fn default_capture_network_timeout_secs() -> f32 {
+    20.0
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetectionMode {
@@ -216,7 +222,10 @@ enum SourceRequest {
     File(PathBuf),
     SequenceFrame(PathBuf),
     Url(String),
-    CaptureUrl(String),
+    CaptureUrl {
+        url: String,
+        network: Option<CaptureNetworkRequest>,
+    },
 }
 
 struct LoadedImage {
@@ -518,6 +527,12 @@ struct PersistedState {
     #[serde(default)]
     capture_interval_secs: f32,
     #[serde(default)]
+    capture_network_enabled: bool,
+    #[serde(default)]
+    capture_network_connection: String,
+    #[serde(default = "default_capture_network_timeout_secs")]
+    capture_network_timeout_secs: f32,
+    #[serde(default)]
     detection_mode: String,
     #[serde(default)]
     yolo_model_path: String,
@@ -628,6 +643,104 @@ struct SequenceFrame {
     timestamp: SystemTime,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedSeriesPoint {
+    timestamp_ms: u64,
+    value: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedHaSeriesData {
+    key: String,
+    unit: String,
+    friendly_name: String,
+    points: Vec<PersistedSeriesPoint>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedShapeTrack {
+    id: u64,
+    group_id: u64,
+    name: String,
+    anchor_pivot: (u32, u32),
+    anchor_frame: usize,
+    anchor_width: usize,
+    anchor_height: usize,
+    anchor_pixel_runs: Vec<[u32; 2]>,
+    matched_pixel_runs: BTreeMap<usize, Vec<[u32; 2]>>,
+    matched_centroids: BTreeMap<usize, (u32, u32)>,
+    observations: BTreeMap<usize, ShapeObservation>,
+    enabled: bool,
+    auto_created: bool,
+}
+
+impl PersistedShapeTrack {
+    fn from_track(track: &ShapeTrack) -> Self {
+        Self {
+            id: track.id,
+            group_id: track.group_id,
+            name: track.name.clone(),
+            anchor_pivot: track.anchor_pivot,
+            anchor_frame: track.anchor_frame,
+            anchor_width: track.anchor_width,
+            anchor_height: track.anchor_height,
+            anchor_pixel_runs: pixels_to_runs(&track.anchor_pixels),
+            matched_pixel_runs: track
+                .matched_pixels
+                .iter()
+                .map(|(&frame, pixels)| (frame, pixels_to_runs(pixels)))
+                .collect(),
+            matched_centroids: track.matched_centroids.clone(),
+            observations: track.observations.clone(),
+            enabled: track.enabled,
+            auto_created: track.auto_created,
+        }
+    }
+
+    fn into_track(self) -> ShapeTrack {
+        ShapeTrack {
+            id: self.id,
+            group_id: self.group_id,
+            name: self.name,
+            anchor_pivot: self.anchor_pivot,
+            anchor_frame: self.anchor_frame,
+            anchor_width: self.anchor_width,
+            anchor_height: self.anchor_height,
+            anchor_pixels: runs_to_pixels(&self.anchor_pixel_runs),
+            matched_pixels: self
+                .matched_pixel_runs
+                .into_iter()
+                .map(|(frame, runs)| (frame, runs_to_pixels(&runs)))
+                .collect(),
+            matched_centroids: self.matched_centroids,
+            observations: self.observations,
+            enabled: self.enabled,
+            auto_created: self.auto_created,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SequenceAnalysisState {
+    version: u32,
+    #[serde(default)]
+    shape_tracks: Vec<PersistedShapeTrack>,
+    #[serde(default)]
+    next_track_id: u64,
+    #[serde(default)]
+    series_meta: Vec<SeriesMeta>,
+    #[serde(default)]
+    plot_windows: Vec<PersistedPlotWindow>,
+    #[serde(default)]
+    next_plot_window_id: u64,
+    #[serde(default)]
+    next_selection_group_id: u64,
+    #[serde(default)]
+    ha_series: Vec<HaSeriesConfig>,
+    #[serde(default)]
+    ha_data: Vec<PersistedHaSeriesData>,
+}
+
 struct ImageSequence {
     root: PathBuf,
     frames: Vec<SequenceFrame>,
@@ -647,12 +760,13 @@ struct MaskComponent {
     area: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ShapeObservation {
     area: usize,
     overlap: f32,
 }
 
+#[derive(Clone, Debug)]
 struct ShapeTrack {
     id: u64,
     /// Permanent group identity. Tracks are grouped when their masks collide into
@@ -847,6 +961,13 @@ struct GreenViewerApp {
 
     continuous_capture: bool,
     capture_interval_secs: f32,
+    capture_network_enabled: bool,
+    /// Canonical UUID of the selected saved NetworkManager Wi-Fi profile.
+    capture_network_connection: String,
+    capture_network_profiles: Vec<SavedWifiProfile>,
+    capture_network_profiles_status: String,
+    capture_network_active_uuid: Option<String>,
+    capture_network_timeout_secs: f32,
     capture_base_dir_input: String,
     capture_save_original: bool,
     capture_save_processed: bool,
@@ -888,6 +1009,34 @@ impl GreenViewerApp {
         } else {
             2.0
         };
+        let capture_network_timeout_secs = if persisted.capture_network_timeout_secs >= 1.0 {
+            persisted.capture_network_timeout_secs.clamp(1.0, 600.0)
+        } else {
+            default_capture_network_timeout_secs()
+        };
+        let capture_network_connection = if persisted.capture_network_connection.trim().is_empty() {
+            String::new()
+        } else {
+            // v0.8.4 allowed either a connection name or UUID. Migrate any saved
+            // name to a canonical UUID so the dropdown remains stable across renames.
+            network_manager::validate_connection(&persisted.capture_network_connection)
+                .unwrap_or_else(|_| persisted.capture_network_connection.clone())
+        };
+        let (capture_network_profiles, capture_network_profiles_status) =
+            match network_manager::saved_wifi_profiles() {
+                Ok(profiles) => {
+                    let status = format!("{} saved Wi-Fi profile(s)", profiles.len());
+                    (profiles, status)
+                }
+                Err(error) => (
+                    Vec::new(),
+                    format!("Failed to query NetworkManager profiles: {error:#}"),
+                ),
+            };
+        let capture_network_active_uuid = network_manager::active_wifi_profile()
+            .ok()
+            .flatten()
+            .map(|profile| profile.uuid);
         let detection_mode = DetectionMode::from_persisted(&persisted.detection_mode);
         let yolo_model_path_input = if persisted.yolo_model_path.trim().is_empty() {
             "yolo26n-seg.onnx".to_owned()
@@ -1140,6 +1289,12 @@ impl GreenViewerApp {
             preferences_dirty: false,
             continuous_capture: false,
             capture_interval_secs,
+            capture_network_enabled: persisted.capture_network_enabled,
+            capture_network_connection,
+            capture_network_profiles,
+            capture_network_profiles_status,
+            capture_network_active_uuid,
+            capture_network_timeout_secs,
             capture_base_dir_input,
             capture_save_original: if persisted_v2 { persisted.capture_save_original } else { true },
             capture_save_processed: if persisted_v2 { persisted.capture_save_processed } else { true },
@@ -1225,6 +1380,78 @@ impl GreenViewerApp {
         }
     }
 
+    fn refresh_capture_network_profiles(&mut self) {
+        match network_manager::saved_wifi_profiles() {
+            Ok(profiles) => {
+                self.capture_network_profiles = profiles;
+                self.capture_network_profiles_status =
+                    format!("{} saved Wi-Fi profile(s)", self.capture_network_profiles.len());
+                self.error = None;
+            }
+            Err(error) => {
+                self.capture_network_profiles.clear();
+                self.capture_network_profiles_status =
+                    format!("Failed to query NetworkManager profiles: {error:#}");
+                self.error = Some(self.capture_network_profiles_status.clone());
+            }
+        }
+        match network_manager::active_wifi_profile() {
+            Ok(active) => {
+                self.capture_network_active_uuid = active.map(|profile| profile.uuid);
+            }
+            Err(error) => {
+                self.capture_network_active_uuid = None;
+                self.capture_network_profiles_status = format!(
+                    "{}; failed to query active Wi-Fi: {error:#}",
+                    self.capture_network_profiles_status
+                );
+            }
+        }
+    }
+
+    fn validate_capture_network_setting(&mut self) -> bool {
+        if !self.capture_network_enabled {
+            return true;
+        }
+        let connection = self.capture_network_connection.trim();
+        if connection.is_empty() {
+            self.error = Some("Switch Wi-Fi for capture is enabled, but no NetworkManager connection name/UUID is configured.".to_owned());
+            return false;
+        }
+        match network_manager::validate_connection(connection) {
+            Ok(uuid) => {
+                self.status = format!("Capture Wi-Fi profile resolved: {connection} → {uuid}");
+                self.error = None;
+                true
+            }
+            Err(error) => {
+                self.error = Some(format!("Invalid capture Wi-Fi profile {connection:?}: {error:#}"));
+                false
+            }
+        }
+    }
+
+    fn capture_network_request(&self) -> Option<CaptureNetworkRequest> {
+        if !self.capture_network_enabled {
+            return None;
+        }
+        let connection = self.capture_network_connection.trim();
+        if connection.is_empty() {
+            return None;
+        }
+        Some(CaptureNetworkRequest {
+            connection: connection.to_owned(),
+            timeout: Duration::from_secs_f32(self.capture_network_timeout_secs.clamp(1.0, 600.0)),
+        })
+    }
+
+    fn queue_capture_url(&mut self, url: String) {
+        self.queue_source(SourceRequest::CaptureUrl {
+            url,
+            network: self.capture_network_request(),
+        });
+    }
+
     fn queue_source(&mut self, request: SourceRequest) {
         if let SourceRequest::SequenceFrame(path) = &request {
             if !path.is_file() {
@@ -1261,8 +1488,8 @@ impl GreenViewerApp {
                 }
             }
         }
-        let is_capture = matches!(&request, SourceRequest::CaptureUrl(_));
-        if matches!(&request, SourceRequest::SequenceFrame(_) | SourceRequest::CaptureUrl(_)) {
+        let is_capture = matches!(&request, SourceRequest::CaptureUrl { .. });
+        if matches!(&request, SourceRequest::SequenceFrame(_) | SourceRequest::CaptureUrl { .. }) {
             self.current_final_mask = None;
         }
         if matches!(
@@ -1497,7 +1724,7 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
-            version: 6,
+            version: 8,
             source_history: self.source_history.clone(),
             status_history: self
                 .status_history
@@ -1516,6 +1743,9 @@ impl GreenViewerApp {
             sequence_history: self.sequence_history.clone(),
             capture_base_dir: self.capture_base_dir_input.clone(),
             capture_interval_secs: self.capture_interval_secs,
+            capture_network_enabled: self.capture_network_enabled,
+            capture_network_connection: self.capture_network_connection.clone(),
+            capture_network_timeout_secs: self.capture_network_timeout_secs,
             detection_mode: self.detection_mode.persisted().to_owned(),
             yolo_model_path: self.yolo_model_path_input.clone(),
             yolo_class_ids: self.yolo_class_ids_input.clone(),
@@ -1562,6 +1792,120 @@ impl GreenViewerApp {
             ha_history_hours: self.ha_history_hours,
             ha_series: self.ha_series.clone(),
         });
+        if let Err(error) = self.save_active_sequence_state() {
+            eprintln!("warning: failed to persist sequence analysis state: {error:#}");
+        }
+    }
+
+    fn mark_persistence_dirty(&mut self) {
+        self.preferences_dirty = true;
+        self.next_preferences_save = Instant::now() + Duration::from_secs(1);
+    }
+
+    fn save_active_sequence_state(&self) -> Result<()> {
+        let Some(sequence) = self.active_sequence.as_ref() else {
+            return Ok(());
+        };
+        let ha_data = self
+            .ha_data
+            .iter()
+            .map(|(key, data)| PersistedHaSeriesData {
+                key: key.clone(),
+                unit: data.unit.clone(),
+                friendly_name: data.friendly_name.clone(),
+                points: data
+                    .points
+                    .iter()
+                    .map(|(&time, &value)| PersistedSeriesPoint {
+                        timestamp_ms: system_time_to_millis(time),
+                        value,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let state = SequenceAnalysisState {
+            version: 1,
+            shape_tracks: self.shape_tracks.iter().map(PersistedShapeTrack::from_track).collect(),
+            next_track_id: self.next_track_id,
+            series_meta: self.series_meta.values().cloned().collect(),
+            plot_windows: self.plot_windows.iter().map(PlotWindowState::persisted).collect(),
+            next_plot_window_id: self.next_plot_window_id,
+            next_selection_group_id: self.next_selection_group_id,
+            ha_series: self.ha_series.clone(),
+            ha_data,
+        };
+        write_sequence_analysis_state(&sequence.root, &state)
+    }
+
+    fn restore_sequence_analysis_state(&mut self, root: &Path) -> Result<bool> {
+        let Some(state) = load_sequence_analysis_state(root)? else {
+            return Ok(false);
+        };
+        if state.version != 1 {
+            return Err(anyhow!(
+                "unsupported sequence analysis state version {} in {}",
+                state.version,
+                root.join("sequence_state.json").display()
+            ));
+        }
+
+        self.shape_tracks = state.shape_tracks.into_iter().map(PersistedShapeTrack::into_track).collect();
+        self.next_track_id = state
+            .next_track_id
+            .max(self.shape_tracks.iter().map(|track| track.id).max().unwrap_or(0));
+
+        if !state.plot_windows.is_empty() {
+            self.plot_windows = state
+                .plot_windows
+                .into_iter()
+                .map(PlotWindowState::from_persisted)
+                .collect();
+        }
+        if self.plot_windows.is_empty() {
+            self.plot_windows.push(PlotWindowState {
+                id: 1,
+                title: "Plant / sensors".to_owned(),
+                open: true,
+                pos: self.shape_plot_window_pos,
+                size: self.shape_plot_window_size,
+                x_center: 0.5,
+                x_zoom: 1.0,
+                y_center: 0.5,
+                y_zoom: 1.0,
+            });
+        }
+        self.next_plot_window_id = state
+            .next_plot_window_id
+            .max(self.plot_windows.iter().map(|plot| plot.id).max().unwrap_or(0).saturating_add(1));
+        self.next_selection_group_id = state.next_selection_group_id.max(1);
+
+        self.series_meta = state
+            .series_meta
+            .into_iter()
+            .map(|meta| (meta.key.clone(), meta))
+            .collect();
+        self.ha_series = state.ha_series;
+        self.ha_data.clear();
+        for data in state.ha_data {
+            let points = data
+                .points
+                .into_iter()
+                .filter_map(|point| millis_to_system_time(point.timestamp_ms).map(|time| (time, point.value)))
+                .collect();
+            self.ha_data.insert(
+                data.key,
+                HaSeriesData {
+                    unit: data.unit,
+                    friendly_name: data.friendly_name,
+                    points,
+                },
+            );
+        }
+        self.sync_home_assistant_series_metadata();
+        self.sync_shape_series_metadata();
+        self.auto_seed_pivots_pending = self.shape_tracks.is_empty();
+        self.shape_plot_open = self.plot_windows.iter().any(|plot| plot.open);
+        Ok(true)
     }
 
     fn tick_preference_persistence(&mut self, ctx: &egui::Context) {
@@ -1614,19 +1958,27 @@ impl GreenViewerApp {
             .map(|group| shape_series_key(group.id))
             .collect::<BTreeSet<_>>();
 
+        let before_len = self.series_meta.len();
         self.series_meta.retain(|key, _| {
             !key.starts_with("shape:") || active_keys.contains(key)
         });
+        let mut changed = self.series_meta.len() != before_len;
         let default_plot = self.default_plot_id();
         for group in groups {
             let key = shape_series_key(group.id);
-            self.series_meta.entry(key.clone()).or_insert_with(|| SeriesMeta {
-                key,
-                name: group.name.clone(),
-                group: "Plant shapes".to_owned(),
-                plot_id: default_plot,
-                visible: true,
-            });
+            if !self.series_meta.contains_key(&key) {
+                self.series_meta.insert(key.clone(), SeriesMeta {
+                    key,
+                    name: group.name.clone(),
+                    group: "Plant shapes".to_owned(),
+                    plot_id: default_plot,
+                    visible: true,
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            self.mark_persistence_dirty();
         }
     }
 
@@ -1770,6 +2122,7 @@ impl GreenViewerApp {
                         }
                     }
                     self.ha_status = format!("Home Assistant: received {sample_count} sample(s).");
+                    self.mark_persistence_dirty();
                 }
                 HaMessage::Failed { id, error } if id == self.ha_request_id || id == 0 => {
                     self.ha_request_pending = false;
@@ -1899,9 +2252,29 @@ impl GreenViewerApp {
                 self.auto_track_highwater_frame = None;
                 self.auto_seed_pivots_pending = true;
                 self.shape_plot_open = false;
-                self.sync_shape_series_metadata();
+
+                let restored_analysis = match self.restore_sequence_analysis_state(&root) {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        self.error = Some(format!("Sequence opened, but sequence_state.json could not be restored: {error:#}"));
+                        false
+                    }
+                };
+                if !restored_analysis {
+                    // A sequence without its own state starts with fresh shape data. Keep the
+                    // app-level HA sensor configuration as a convenient template, but do not
+                    // inherit numeric samples from a different sequence.
+                    self.ha_data.clear();
+                    self.series_meta.clear();
+                    self.sync_home_assistant_series_metadata();
+                    self.sync_shape_series_metadata();
+                }
                 self.remember_sequence(root_label.clone());
-                self.status = format!("Opened image sequence {root_label}");
+                self.status = if restored_analysis {
+                    format!("Opened image sequence {root_label}; restored pivots, sensor history and plot assignments")
+                } else {
+                    format!("Opened image sequence {root_label}")
+                };
                 self.error = None;
                 self.original_view.reset_fit();
                 self.processed_view.reset_fit();
@@ -2024,6 +2397,9 @@ impl GreenViewerApp {
             self.error = Some("Enable original and/or processed capture saving first.".to_owned());
             return;
         }
+        if !self.validate_capture_network_setting() {
+            return;
+        }
         let Some((root, frames)) = self
             .active_sequence
             .as_ref()
@@ -2119,6 +2495,9 @@ impl GreenViewerApp {
             self.error = Some("Enable original and/or processed capture saving first.".to_owned());
             return;
         }
+        if !self.validate_capture_network_setting() {
+            return;
+        }
 
         let address = self.url_input.trim().to_owned();
         let url = match normalize_camera_address(&address) {
@@ -2183,6 +2562,8 @@ impl GreenViewerApp {
         self.shape_tracks.clear();
         self.auto_track_highwater_frame = None;
         self.auto_seed_pivots_pending = true;
+        self.ha_data.clear();
+        self.sync_home_assistant_series_metadata();
         self.sync_shape_series_metadata();
         self.capture_url = Some(url);
         self.pending_capture = None;
@@ -2242,7 +2623,7 @@ impl GreenViewerApp {
             {
                 if let Some(url) = self.capture_url.clone() {
                     self.capture_retry_due = None;
-                    self.queue_source(SourceRequest::CaptureUrl(url));
+                    self.queue_capture_url(url);
                     let new_source_id = self.active_source_id;
                     if let Some(pending) = self.pending_capture.as_mut() {
                         pending.source_id = new_source_id;
@@ -2291,7 +2672,7 @@ impl GreenViewerApp {
             // Do not expose a frame to the live sequence until its backing file exists.
             // Previously the frame was appended optimistically here, so tracking/playback
             // could try to open a path that had not been written yet.
-            self.queue_source(SourceRequest::CaptureUrl(url));
+            self.queue_capture_url(url);
             self.pending_capture = Some(PendingCapture {
                 source_id: self.active_source_id,
                 processing_job_id: None,
@@ -2868,6 +3249,7 @@ impl GreenViewerApp {
             self.merge_colliding_shape_groups(frame_index);
         }
         self.sync_shape_series_metadata();
+        self.mark_persistence_dirty();
     }
 
     fn retire_auto_anchors_removed_by_filter(
@@ -2928,6 +3310,7 @@ impl GreenViewerApp {
         self.merge_colliding_shape_groups(frame_index);
         self.reconcile_auto_shape_tracks(frame_index, width, height, &components);
         self.sync_shape_series_metadata();
+        self.mark_persistence_dirty();
     }
 
     fn reconcile_auto_shape_tracks(
@@ -3950,6 +4333,98 @@ time: {}", format_absolute_time(timestamp)));
             }
         });
         ui.add_enabled_ui(!self.continuous_capture, |ui| {
+            ui.group(|ui| {
+                ui.checkbox(&mut self.capture_network_enabled, "Switch Wi-Fi for capture");
+                ui.add_enabled_ui(self.capture_network_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Capture connection");
+                        let profiles = self.capture_network_profiles.clone();
+                        let active_uuid = self.capture_network_active_uuid.clone();
+                        let selected_label = profiles
+                            .iter()
+                            .find(|profile| profile.uuid == self.capture_network_connection)
+                            .map(|profile| {
+                                let marker = if active_uuid.as_deref() == Some(profile.uuid.as_str()) {
+                                    "● "
+                                } else {
+                                    "○ "
+                                };
+                                format!("{marker}{} — {}", profile.name, &profile.uuid[..8.min(profile.uuid.len())])
+                            })
+                            .unwrap_or_else(|| {
+                                if self.capture_network_connection.trim().is_empty() {
+                                    "Choose saved Wi-Fi profile…".to_owned()
+                                } else {
+                                    format!("Missing profile — {}", self.capture_network_connection)
+                                }
+                            });
+                        let mut changed = false;
+                        egui::ComboBox::from_id_salt("capture_network_profile_dropdown")
+                            .selected_text(selected_label)
+                            .width(360.0)
+                            .show_ui(ui, |ui| {
+                                if profiles.is_empty() {
+                                    ui.label("No saved Wi-Fi profiles found");
+                                }
+                                for profile in &profiles {
+                                    let active = active_uuid.as_deref() == Some(profile.uuid.as_str());
+                                    let marker = if active { "●" } else { "○" };
+                                    let short_uuid = &profile.uuid[..8.min(profile.uuid.len())];
+                                    let label = format!("{marker} {} — {short_uuid}", profile.name);
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut self.capture_network_connection,
+                                            profile.uuid.clone(),
+                                            label,
+                                        )
+                                        .changed();
+                                }
+                            });
+                        if changed {
+                            self.status = "Capture Wi-Fi profile changed".to_owned();
+                            self.error = None;
+                            self.save_preferences();
+                        }
+                        if ui.small_button("Refresh").clicked() {
+                            self.refresh_capture_network_profiles();
+                        }
+                        if ui.small_button("Use current").clicked() {
+                            match network_manager::active_wifi_profile() {
+                                Ok(Some(profile)) => {
+                                    self.capture_network_connection = profile.uuid.clone();
+                                    self.capture_network_active_uuid = Some(profile.uuid.clone());
+                                    self.status = format!(
+                                        "Capture Wi-Fi set to {} ({}) on {}",
+                                        profile.name, profile.uuid, profile.device
+                                    );
+                                    self.error = None;
+                                    self.refresh_capture_network_profiles();
+                                    self.save_preferences();
+                                }
+                                Ok(None) => {
+                                    self.error = Some("No active NetworkManager Wi-Fi connection found".to_owned());
+                                }
+                                Err(error) => {
+                                    self.error = Some(format!("Failed to query active Wi-Fi: {error:#}"));
+                                }
+                            }
+                        }
+                    });
+                    ui.small(&self.capture_network_profiles_status);
+                    ui.horizontal(|ui| {
+                        ui.label("Switch/readiness timeout");
+                        ui.add(
+                            egui::DragValue::new(&mut self.capture_network_timeout_secs)
+                                .range(1.0..=600.0)
+                                .speed(1.0)
+                                .suffix(" s"),
+                        );
+                    });
+                    ui.small(
+                        "Choose a saved NetworkManager Wi-Fi profile from the dropdown. Before every capture/retry the app compares UUIDs; if the target is already active, it does not switch networks. Before the HTTP GET it still waits for the target profile to be active, for its device to have IPv4, and for the camera host:port to accept TCP connections. If switching was needed, the previous Wi-Fi is restored before retry cooldown.",
+                    );
+                });
+            });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.capture_save_original, "Original");
                 ui.checkbox(&mut self.capture_save_processed, "Processed");
@@ -4655,6 +5130,7 @@ time: {}", format_absolute_time(timestamp)));
                 let config = self.ha_series.remove(index);
                 self.ha_data.remove(&config.key);
                 self.series_meta.remove(&config.key);
+                self.mark_persistence_dirty();
                 self.save_preferences();
             }
         });
@@ -5394,7 +5870,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.8.2")
+        .user_agent("rust-edge-gui/0.8.6")
         .build()
         .expect("failed to build HTTP client");
 
@@ -5411,12 +5887,15 @@ fn source_loop(
         let remember_source = matches!(&request, SourceRequest::File(_) | SourceRequest::Url(_));
         let preserve_view = matches!(
             &request,
-            SourceRequest::SequenceFrame(_) | SourceRequest::CaptureUrl(_)
+            SourceRequest::SequenceFrame(_) | SourceRequest::CaptureUrl { .. }
         );
         let result = match request {
             SourceRequest::File(path) | SourceRequest::SequenceFrame(path) => load_file_source(&path),
-            SourceRequest::Url(url) | SourceRequest::CaptureUrl(url) => {
-                load_url_source(&client, &url)
+            SourceRequest::Url(url) => load_url_source(&client, &url),
+            SourceRequest::CaptureUrl { url, network } => {
+                network_manager::with_capture_network(network.as_ref(), &url, || {
+                    load_url_source(&client, &url)
+                })
             }
         };
 
@@ -6468,6 +6947,80 @@ fn remove_and_shift_index_map<T>(map: &mut BTreeMap<usize, T>, removed_index: us
             }
         })
         .collect();
+}
+
+fn pixels_to_runs(pixels: &[u32]) -> Vec<[u32; 2]> {
+    if pixels.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = pixels.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut runs = Vec::new();
+    let mut start = sorted[0];
+    let mut end = start;
+    for &pixel in sorted.iter().skip(1) {
+        if pixel == end.saturating_add(1) {
+            end = pixel;
+        } else {
+            runs.push([start, end]);
+            start = pixel;
+            end = pixel;
+        }
+    }
+    runs.push([start, end]);
+    runs
+}
+
+fn runs_to_pixels(runs: &[[u32; 2]]) -> Vec<u32> {
+    let capacity = runs
+        .iter()
+        .map(|run| run[1].saturating_sub(run[0]).saturating_add(1) as usize)
+        .sum();
+    let mut pixels = Vec::with_capacity(capacity);
+    for &[start, end] in runs {
+        if end < start {
+            continue;
+        }
+        pixels.extend(start..=end);
+    }
+    pixels
+}
+
+fn system_time_to_millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn millis_to_system_time(timestamp_ms: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_millis(timestamp_ms))
+}
+
+fn write_sequence_analysis_state(root: &Path, state: &SequenceAnalysisState) -> Result<()> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("cannot create {}", root.display()))?;
+    let bytes = serde_json::to_vec_pretty(state)?;
+    let target = root.join("sequence_state.json");
+    let temporary = root.join("sequence_state.json.tmp");
+    std::fs::write(&temporary, bytes)
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    std::fs::rename(&temporary, &target)
+        .with_context(|| format!("cannot replace {}", target.display()))?;
+    Ok(())
+}
+
+fn load_sequence_analysis_state(root: &Path) -> Result<Option<SequenceAnalysisState>> {
+    let path = root.join("sequence_state.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let state = serde_json::from_slice(&bytes)
+        .with_context(|| format!("cannot parse {}", path.display()))?;
+    Ok(Some(state))
 }
 
 fn write_sequence_manifest(sequence: &ImageSequence) -> Result<()> {

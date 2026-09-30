@@ -33,6 +33,7 @@
             clippy
             pkg-config
             dbus
+            networkmanager
             openssl
             vulkan-loader
             vulkan-tools

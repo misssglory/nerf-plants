@@ -1,3 +1,34 @@
+# v0.8.6
+
+- Capture Wi-Fi readiness gate: after NetworkManager activation, wait for the target UUID to be active, its Wi-Fi device to have IPv4, and the camera host:port to accept TCP connections before issuing the HTTP image request.
+- If capture Wi-Fi is already active, network switching is skipped completely, but host readiness is still verified.
+- The configured timeout is a shared budget for profile activation plus readiness polling.
+- On readiness failure after a switch, restore the previous Wi-Fi before the normal retry cooldown/Telegram path.
+- Readiness polling supports systems with more than one simultaneously active Wi-Fi profile by matching the target UUID directly.
+
+## v0.8.5 — Wi-Fi profile dropdown
+
+- Replace the manual NetworkManager capture-profile text input with a dropdown populated from saved Wi-Fi connection profiles.
+- Mark the active saved profile with `●` and inactive saved profiles with `○`; display a short UUID beside each name.
+- Add `Refresh` to reload saved/active NetworkManager profiles on demand and keep `Use current` as a quick selector.
+- Persist the chosen capture network as a canonical UUID.
+- Migrate older v0.8.4 persisted connection names to UUIDs at startup when the profile still exists.
+- Keep the existing no-op behavior when capture/current UUIDs are equal and previous-network restoration during retry cooldown.
+- Bump package version to 0.8.5.
+
+## 0.8.3
+
+- Persist sequence-specific analysis data in `<sequence>/sequence_state.json`.
+- Persist tracked pivots, collision groups, per-frame mask geometry/areas, centroids, and tracking observations with the sequence.
+- Compress tracked mask geometry into contiguous pixel-index runs in JSON to keep sequence state substantially smaller than raw pixel arrays.
+- Persist Home Assistant / FlowerCare sensor configuration and collected numeric samples with the sequence. Credentials remain app-local and are never copied into sequence state.
+- Persist timeseries metadata (`name`, logical `group`, visibility, target `plot_id`) with the sequence.
+- Persist plot windows, titles, positions/sizes, open state, and plot viewport state with the sequence.
+- Restore sequence analysis state automatically when a sequence is opened.
+- New sequences start with fresh numeric sensor history while keeping the app-level HA entity list as a convenient template.
+- Debounced persistence now also runs after automatic shape-tracking updates and Home Assistant samples arrive, not only after direct UI interaction.
+- Bump package/user-agent version to 0.8.3.
+
 # Changes
 
 ## 0.8.2
@@ -149,3 +180,14 @@
 - Added original-image pixel inspection on hover (x/y, RGBA, hex).
 - Added capture-state handling so a slow camera/processor does not enqueue overlapping capture requests.
 - Updated package version to 0.5.0.
+
+## v0.8.4 — Capture Wi-Fi switching
+
+- Added optional NetworkManager Wi-Fi switching for continuous capture.
+- Capture Wi-Fi is configured by an existing NetworkManager connection name or UUID; Wi-Fi credentials remain in NetworkManager and are not stored by the app.
+- The active Wi-Fi profile is detected automatically before every scheduled capture/retry.
+- Target/current profiles are compared by canonical NetworkManager UUID; if they match, no disconnect/reconnect is performed.
+- When profiles differ, the image-source worker switches to the capture profile, fetches the frame, and restores the previously active Wi-Fi before returning success/failure to the GUI.
+- Retry cooldown therefore runs on the previous network automatically; the next retry switches to the capture profile again.
+- Added capture-network timeout and a `Use current` helper in Continuous capture settings.
+- Network switching runs inside the source worker so `nmcli --wait` does not block the egui UI thread.

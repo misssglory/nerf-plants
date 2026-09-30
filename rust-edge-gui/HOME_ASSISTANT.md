@@ -39,3 +39,9 @@ In the **Processed** image hold **Shift** and drag a rectangle around pivot mark
 - `GET /api/states/<entity_id>` for snapshots.
 - `GET /api/history/period/<timestamp>?filter_entity_id=...&end_time=...` for backfill.
 - `Authorization: Bearer <token>` for authentication.
+
+## Sequence-local persistence
+
+When an image sequence is active, configured Home Assistant entity definitions and all collected numeric samples are also written to `<sequence>/sequence_state.json`. Timeseries names, logical groups, visibility, target plot IDs, and plot-window state are stored there as well. Reopening that sequence restores the sensor history and dashboard layout automatically.
+
+The Home Assistant base URL and access token are **not** copied into the sequence folder. Credentials remain in the app-local state/config only.
