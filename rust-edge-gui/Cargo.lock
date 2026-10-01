@@ -3474,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "rust-edge-gui"
-version = "0.8.6"
+version = "0.8.9"
 dependencies = [
  "anyhow",
  "chrono",

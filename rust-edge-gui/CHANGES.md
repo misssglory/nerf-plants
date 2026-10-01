@@ -1,3 +1,23 @@
+# v0.8.9
+
+- Fixed egui 0.35 compilation for transparent plot windows: use `Context::theme()` + `Context::style_of()` instead of removed `Context::style()`.
+- Plot frame now derives its fill from the active dark/light theme before applying per-window alpha.
+
+# v0.8.8
+
+- Add per-plot `Background opacity` control with a `0.00..=1.00` range.
+- Default every new and migrated plot window to `0.00` background opacity (fully transparent).
+- Apply opacity to the floating plot-window background while keeping plotted series, pivots/points, axes, grid and text opaque.
+- Persist opacity in both app preferences and sequence-level `sequence_state.json`.
+- Bump package/user-agent version to 0.8.8.
+
+# v0.8.7
+
+- Move scheduled-capture retry cooldown out of `config.toml` and into the Continuous capture interface.
+- Add persisted HTTP image request timeout to the Continuous capture interface.
+- Keep Wi-Fi switch/readiness timeout as a separate persisted control.
+- `config.toml` now contains Telegram credentials/settings only; capture timing is app UI state.
+
 # v0.8.6
 
 - Capture Wi-Fi readiness gate: after NetworkManager activation, wait for the target UUID to be active, its Wi-Fi device to have IPv4, and the camera host:port to accept TCP connections before issuing the HTTP image request.
@@ -35,7 +55,7 @@
 
 - Add formatted local timestamps to current Status and a persistent 250-entry status/error history.
 - Make processed-image pivot colors identical to the corresponding shape-area timeseries colors.
-- Add `config.toml` Telegram credentials/settings (`enabled`, `bot_token`, `chat_id`, `retry_cooldown_seconds`).
+- Add `config.toml` Telegram notification configuration (historically included retry timing; v0.8.7 moves capture timing into the GUI).
 - Send Telegram notification when image loading fails.
 - For continuous capture, retry a failed scheduled frame after a cooldown only until the next scheduled frame is due; never let one bad slot freeze subsequent capture.
 - Send one recovery notification when a retried capture succeeds.

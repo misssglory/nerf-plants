@@ -26,7 +26,7 @@ use home_assistant::{HaMessage, HaRequest, HaRequestKind, HaSeriesRequest, HaWor
 use telegram::{load_telegram_config, TelegramConfig, TelegramNotifier};
 use network_manager::{CaptureNetworkRequest, SavedWifiProfile};
 
-const APP_TITLE: &str = "Rust Edge GUI v0.8.6 — Wi-Fi Readiness Gate";
+const APP_TITLE: &str = "Rust Edge GUI v0.8.9 — Transparent Plot Windows";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -35,6 +35,14 @@ const MAX_STATUS_HISTORY: usize = 250;
 
 fn default_capture_network_timeout_secs() -> f32 {
     20.0
+}
+
+fn default_capture_retry_cooldown_secs() -> f32 {
+    10.0
+}
+
+fn default_capture_request_timeout_secs() -> f32 {
+    30.0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,6 +233,7 @@ enum SourceRequest {
     CaptureUrl {
         url: String,
         network: Option<CaptureNetworkRequest>,
+        request_timeout: Duration,
     },
 }
 
@@ -443,6 +452,8 @@ struct PersistedPlotWindow {
     y_center: f32,
     #[serde(default = "default_plot_zoom")]
     y_zoom: f32,
+    #[serde(default)]
+    background_opacity: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -456,6 +467,7 @@ struct PlotWindowState {
     x_zoom: f32,
     y_center: f32,
     y_zoom: f32,
+    background_opacity: f32,
 }
 
 impl PlotWindowState {
@@ -470,6 +482,7 @@ impl PlotWindowState {
             x_zoom: value.x_zoom.clamp(1.0, 10_000.0),
             y_center: value.y_center.clamp(0.0, 1.0),
             y_zoom: value.y_zoom.clamp(1.0, 10_000.0),
+            background_opacity: value.background_opacity.clamp(0.0, 1.0),
         }
     }
 
@@ -484,6 +497,7 @@ impl PlotWindowState {
             x_zoom: self.x_zoom,
             y_center: self.y_center,
             y_zoom: self.y_zoom,
+            background_opacity: self.background_opacity,
         }
     }
 }
@@ -532,6 +546,10 @@ struct PersistedState {
     capture_network_connection: String,
     #[serde(default = "default_capture_network_timeout_secs")]
     capture_network_timeout_secs: f32,
+    #[serde(default = "default_capture_retry_cooldown_secs")]
+    capture_retry_cooldown_secs: f32,
+    #[serde(default = "default_capture_request_timeout_secs")]
+    capture_request_timeout_secs: f32,
     #[serde(default)]
     detection_mode: String,
     #[serde(default)]
@@ -968,6 +986,10 @@ struct GreenViewerApp {
     capture_network_profiles_status: String,
     capture_network_active_uuid: Option<String>,
     capture_network_timeout_secs: f32,
+    /// Delay before retrying a failed scheduled capture. UI/persistence setting.
+    capture_retry_cooldown_secs: f32,
+    /// Whole HTTP request timeout for camera image fetches.
+    capture_request_timeout_secs: f32,
     capture_base_dir_input: String,
     capture_save_original: bool,
     capture_save_processed: bool,
@@ -1013,6 +1035,16 @@ impl GreenViewerApp {
             persisted.capture_network_timeout_secs.clamp(1.0, 600.0)
         } else {
             default_capture_network_timeout_secs()
+        };
+        let capture_retry_cooldown_secs = if persisted.capture_retry_cooldown_secs >= 0.1 {
+            persisted.capture_retry_cooldown_secs.clamp(0.1, 3600.0)
+        } else {
+            default_capture_retry_cooldown_secs()
+        };
+        let capture_request_timeout_secs = if persisted.capture_request_timeout_secs >= 0.5 {
+            persisted.capture_request_timeout_secs.clamp(0.5, 600.0)
+        } else {
+            default_capture_request_timeout_secs()
         };
         let capture_network_connection = if persisted.capture_network_connection.trim().is_empty() {
             String::new()
@@ -1113,6 +1145,7 @@ impl GreenViewerApp {
                 x_zoom: if persisted_v4 { persisted.plot_x_zoom.clamp(1.0, 10_000.0) } else { 1.0 },
                 y_center: if persisted_v4 { persisted.plot_y_center.clamp(0.0, 1.0) } else { 0.5 },
                 y_zoom: if persisted_v4 { persisted.plot_y_zoom.clamp(1.0, 10_000.0) } else { 1.0 },
+                background_opacity: 0.0,
             }]
         };
         if plot_windows.is_empty() {
@@ -1126,6 +1159,7 @@ impl GreenViewerApp {
                 x_zoom: 1.0,
                 y_center: 0.5,
                 y_zoom: 1.0,
+                background_opacity: 0.0,
             });
         }
         let next_plot_window_id = plot_windows.iter().map(|plot| plot.id).max().unwrap_or(0) + 1;
@@ -1295,6 +1329,8 @@ impl GreenViewerApp {
             capture_network_profiles_status,
             capture_network_active_uuid,
             capture_network_timeout_secs,
+            capture_retry_cooldown_secs,
+            capture_request_timeout_secs,
             capture_base_dir_input,
             capture_save_original: if persisted_v2 { persisted.capture_save_original } else { true },
             capture_save_processed: if persisted_v2 { persisted.capture_save_processed } else { true },
@@ -1364,7 +1400,7 @@ impl GreenViewerApp {
     }
 
     fn capture_retry_cooldown(&self) -> Duration {
-        Duration::from_secs_f32(self.telegram_config.retry_cooldown_seconds.clamp(0.1, 3600.0))
+        Duration::from_secs_f32(self.capture_retry_cooldown_secs.clamp(0.1, 3600.0))
     }
 
     fn abandon_failed_capture_slot(&mut self, reason: &str) {
@@ -1449,6 +1485,9 @@ impl GreenViewerApp {
         self.queue_source(SourceRequest::CaptureUrl {
             url,
             network: self.capture_network_request(),
+            request_timeout: Duration::from_secs_f32(
+                self.capture_request_timeout_secs.clamp(0.5, 600.0),
+            ),
         });
     }
 
@@ -1630,7 +1669,7 @@ impl GreenViewerApp {
                             let retry_note = if can_retry {
                                 format!(
                                     "Retrying every {:.1}s until the next scheduled frame.",
-                                    self.telegram_config.retry_cooldown_seconds
+                                    self.capture_retry_cooldown_secs
                                 )
                             } else {
                                 "No retry fits before the next scheduled frame; this slot will be skipped.".to_owned()
@@ -1724,7 +1763,7 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
-            version: 8,
+            version: 9,
             source_history: self.source_history.clone(),
             status_history: self
                 .status_history
@@ -1746,6 +1785,8 @@ impl GreenViewerApp {
             capture_network_enabled: self.capture_network_enabled,
             capture_network_connection: self.capture_network_connection.clone(),
             capture_network_timeout_secs: self.capture_network_timeout_secs,
+            capture_retry_cooldown_secs: self.capture_retry_cooldown_secs,
+            capture_request_timeout_secs: self.capture_request_timeout_secs,
             detection_mode: self.detection_mode.persisted().to_owned(),
             yolo_model_path: self.yolo_model_path_input.clone(),
             yolo_class_ids: self.yolo_class_ids_input.clone(),
@@ -1872,6 +1913,7 @@ impl GreenViewerApp {
                 x_zoom: 1.0,
                 y_center: 0.5,
                 y_zoom: 1.0,
+                background_opacity: 0.0,
             });
         }
         self.next_plot_window_id = state
@@ -1941,6 +1983,7 @@ impl GreenViewerApp {
             x_zoom: 1.0,
             y_center: 0.5,
             y_zoom: 1.0,
+            background_opacity: 0.0,
         });
         self.save_preferences();
         id
@@ -4316,6 +4359,33 @@ time: {}", format_absolute_time(timestamp)));
                     .suffix(" s"),
             );
         });
+        ui.horizontal(|ui| {
+            ui.label("Retry cooldown");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.capture_retry_cooldown_secs)
+                        .range(0.1..=3600.0)
+                        .speed(0.5)
+                        .suffix(" s"),
+                )
+                .changed()
+            {
+                self.mark_persistence_dirty();
+            }
+            ui.label("HTTP image timeout");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.capture_request_timeout_secs)
+                        .range(0.5..=600.0)
+                        .speed(1.0)
+                        .suffix(" s"),
+                )
+                .changed()
+            {
+                self.mark_persistence_dirty();
+            }
+        });
+        ui.small("Retry cooldown is the wait between failed scheduled-frame attempts. HTTP image timeout limits the camera GET itself; Wi-Fi switch/readiness timeout below is separate.");
         ui.label("Save directory");
         ui.horizontal(|ui| {
             ui.add(
@@ -4929,10 +4999,17 @@ time: {}", format_absolute_time(timestamp)));
             let mut remove_plot = None;
             let can_remove_plot = self.plot_windows.len() > 1;
             for (index, plot) in self.plot_windows.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut plot.open, "");
                     ui.monospace(format!("P{}", plot.id));
                     ui.add(egui::TextEdit::singleline(&mut plot.title).desired_width(220.0));
+                    ui.label("Background opacity");
+                    ui.add(
+                        egui::Slider::new(&mut plot.background_opacity, 0.0..=1.0)
+                            .fixed_decimals(2)
+                            .show_value(true),
+                    );
+                    ui.small("0 = transparent");
                     if can_remove_plot && ui.small_button("×").clicked() {
                         remove_plot = Some(index);
                     }
@@ -5379,6 +5456,17 @@ time: {}", format_absolute_time(timestamp)));
             let mut x_zoom = self.plot_windows[index].x_zoom.clamp(1.0, 10_000.0);
             let mut y_center = self.plot_windows[index].y_center.clamp(0.0, 1.0);
             let mut y_zoom = self.plot_windows[index].y_zoom.clamp(1.0, 10_000.0);
+            let background_opacity = self.plot_windows[index].background_opacity.clamp(0.0, 1.0);
+            let alpha = (background_opacity * 255.0).round() as u8;
+            let plot_style = ctx.style_of(ctx.theme());
+            let base_fill = plot_style.visuals.window_fill;
+            let transparent_fill = egui::Color32::from_rgba_unmultiplied(
+                base_fill.r(),
+                base_fill.g(),
+                base_fill.b(),
+                alpha,
+            );
+            let plot_frame = egui::Frame::window(plot_style.as_ref()).fill(transparent_fill);
             let mut local_seek = None;
 
             let response = egui::Window::new(title.clone())
@@ -5388,6 +5476,7 @@ time: {}", format_absolute_time(timestamp)));
                 .default_size(size)
                 .current_pos(pos)
                 .min_size(egui::vec2(160.0, 58.0))
+                .frame(plot_frame)
                 .constrain(false)
                 .resizable([true, true])
                 .show(ctx, |ui| {
@@ -5870,7 +5959,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.8.6")
+        .user_agent("rust-edge-gui/0.8.9")
         .build()
         .expect("failed to build HTTP client");
 
@@ -5892,10 +5981,22 @@ fn source_loop(
         let result = match request {
             SourceRequest::File(path) | SourceRequest::SequenceFrame(path) => load_file_source(&path),
             SourceRequest::Url(url) => load_url_source(&client, &url),
-            SourceRequest::CaptureUrl { url, network } => {
-                network_manager::with_capture_network(network.as_ref(), &url, || {
-                    load_url_source(&client, &url)
-                })
+            SourceRequest::CaptureUrl { url, network, request_timeout } => {
+                (|| -> Result<LoadedImage> {
+                    let request_timeout = request_timeout
+                        .max(Duration::from_millis(500))
+                        .min(Duration::from_secs(600));
+                    let connect_timeout = request_timeout.min(Duration::from_secs(5));
+                    let capture_client = reqwest::blocking::Client::builder()
+                        .connect_timeout(connect_timeout)
+                        .timeout(request_timeout)
+                        .user_agent("rust-edge-gui/0.8.9")
+                        .build()
+                        .context("failed to build capture HTTP client")?;
+                    network_manager::with_capture_network(network.as_ref(), &url, || {
+                        load_url_source(&capture_client, &url)
+                    })
+                })()
             }
         };
 

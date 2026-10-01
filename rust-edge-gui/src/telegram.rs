@@ -14,8 +14,6 @@ pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
     pub chat_id: String,
-    #[serde(default = "default_retry_cooldown")]
-    pub retry_cooldown_seconds: f32,
 }
 
 impl Default for TelegramConfig {
@@ -24,14 +22,10 @@ impl Default for TelegramConfig {
             enabled: false,
             bot_token: String::new(),
             chat_id: String::new(),
-            retry_cooldown_seconds: default_retry_cooldown(),
         }
     }
 }
 
-fn default_retry_cooldown() -> f32 {
-    10.0
-}
 
 #[derive(Default, Deserialize)]
 struct AppConfig {
@@ -72,7 +66,6 @@ pub fn load_telegram_config() -> (TelegramConfig, String) {
     };
 
     let mut config = parsed.telegram;
-    config.retry_cooldown_seconds = config.retry_cooldown_seconds.clamp(0.1, 3600.0);
     if config.enabled && (config.bot_token.trim().is_empty() || config.chat_id.trim().is_empty()) {
         config.enabled = false;
         return (
@@ -82,11 +75,7 @@ pub fn load_telegram_config() -> (TelegramConfig, String) {
     }
 
     let status = if config.enabled {
-        format!(
-            "Telegram enabled · retry cooldown {:.1}s · {}",
-            config.retry_cooldown_seconds,
-            path.display()
-        )
+        format!("Telegram enabled · {}", path.display())
     } else {
         format!("Telegram disabled · {}", path.display())
     };
@@ -112,7 +101,7 @@ impl TelegramNotifier {
                 let client = match reqwest::blocking::Client::builder()
                     .connect_timeout(Duration::from_secs(5))
                     .timeout(Duration::from_secs(15))
-                    .user_agent("rust-edge-gui/0.8.6")
+                    .user_agent("rust-edge-gui/0.8.9")
                     .build()
                 {
                     Ok(client) => client,

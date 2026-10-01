@@ -1,6 +1,21 @@
-# rust-edge-gui 0.8.6
+# rust-edge-gui 0.8.8
 
 Rust/egui plant-mask viewer and timeseries dashboard for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, native offline YOLO segmentation, temporal filtering, automatic plant/leaf tracking, multiple resizable plots, and external Home Assistant sensor timeseries.
+
+## What changed in 0.8.8
+
+- Added an independent **Background opacity** setting to every plot window.
+- Plot background opacity ranges from `0.00` (fully transparent) to `1.00` (fully opaque) and defaults to `0.00`.
+- Plot lines, points, axes, grid, labels, hover values and the current-frame marker remain fully visible; only the window background fill changes.
+- Per-plot opacity persists in both global app state and each sequence's `sequence_state.json`, alongside plot title/position/size/pan/zoom.
+- Existing saved plot states without the new field migrate to `0.00` automatically.
+
+## What changed in 0.8.7
+
+- **Retry cooldown** moved from `config.toml` to **Continuous capture** and is persisted with the GUI settings.
+- Added **HTTP image timeout** beside retry cooldown; it limits each camera GET independently from Wi-Fi readiness.
+- **Switch/readiness timeout** remains a separate control for NetworkManager activation + host readiness.
+- `config.toml` now contains Telegram credentials only; capture timing no longer depends on editing the file.
 
 ## What changed in 0.8.6
 
@@ -43,7 +58,6 @@ Edit `config.toml`:
 enabled = true
 bot_token = "123456:YOUR_BOT_TOKEN"
 chat_id = "YOUR_CHAT_ID"
-retry_cooldown_seconds = 10.0
 ```
 
 Do not commit a populated credentials file to a public repository. Telegram settings are read at startup and are not copied into GUI persistence/state JSON.
@@ -353,9 +367,9 @@ Continuous capture can temporarily switch NetworkManager to a saved Wi-Fi profil
 
 For every capture attempt the application detects the currently active Wi-Fi profile, resolves the requested capture profile to its canonical UUID, and compares them. If they are already the same, no network operation is performed. Otherwise the source worker runs `nmcli connection up` for the capture profile, fetches the image, then restores the profile that was active before that attempt. This restoration also happens after failed fetches, so Telegram/Home Assistant and the retry cooldown run on the normal network. The next retry switches to the camera network again.
 
-This feature requires NetworkManager and `nmcli`. The **Switch timeout** controls how long `nmcli` may wait for each activation. Use **Refresh** to reload saved/active profiles and **Use current** to select the currently active Wi-Fi profile. The selected profile is persisted by UUID.
+This feature requires NetworkManager and `nmcli`. **Retry cooldown** and **HTTP image timeout** are configured directly in Continuous capture. The **Switch/readiness timeout** separately controls the total budget for NetworkManager activation plus camera-host readiness. Use **Refresh** to reload saved/active profiles and **Use current** to select the currently active Wi-Fi profile. The selected profile is persisted by UUID.
 
 
-## Capture network readiness (v0.8.6)
+## Capture network readiness (v0.8.7)
 
 When Wi-Fi switching is enabled, each capture attempt waits for the selected NetworkManager UUID to be active, for IPv4 on its device, and for the camera URL host/port to accept a TCP connection before the first HTTP GET. If the selected profile is already active, no network switch occurs.

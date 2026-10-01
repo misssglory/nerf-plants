@@ -72,7 +72,7 @@ fn worker_loop(
     let client = match Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(45))
-        .user_agent("rust-edge-gui/0.8.6")
+        .user_agent("rust-edge-gui/0.8.9")
         .build()
     {
         Ok(client) => client,
