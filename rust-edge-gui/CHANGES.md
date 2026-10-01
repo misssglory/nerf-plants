@@ -1,3 +1,12 @@
+# v0.9.0
+
+- Add `Original` and `Processed` visibility toggles to **Timeseries / plot windows**.
+- Re-opening either image window from that manager resets its window position to the default and resets image pan/zoom to Fit; closing it does not destroy the saved transform. Normal relaunch restores visibility, position, size, pan and zoom from persisted state.
+- Stop rebuilding merged shape-group timeseries from every mask pixel on every egui repaint. Group union areas/centroids are now cached and invalidated only when tracking/masks actually change.
+- Skip pivot-overlay construction entirely while the Processed window is hidden.
+- Decimate very dense plot rendering to at most roughly four rendered samples per horizontal pixel while retaining the final point, reducing draw cost for long sequences without changing stored data.
+- Bump package/user-agent version to 0.9.0.
+
 # v0.8.9
 
 - Fixed egui 0.35 compilation for transparent plot windows: use `Context::theme()` + `Context::style_of()` instead of removed `Context::style()`.

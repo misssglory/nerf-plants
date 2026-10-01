@@ -26,7 +26,7 @@ use home_assistant::{HaMessage, HaRequest, HaRequestKind, HaSeriesRequest, HaWor
 use telegram::{load_telegram_config, TelegramConfig, TelegramNotifier};
 use network_manager::{CaptureNetworkRequest, SavedWifiProfile};
 
-const APP_TITLE: &str = "Rust Edge GUI v0.8.9 — Transparent Plot Windows";
+const APP_TITLE: &str = "Rust Edge GUI v0.9.0 — Cached Long-Sequence Rendering";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -921,6 +921,11 @@ struct GreenViewerApp {
     temporal_overlap_threshold: f32,
     track_overlap_threshold: f32,
     shape_tracks: Vec<ShapeTrack>,
+    // Derived union-area/centroid data for tracked shape groups. Building this is
+    // expensive because merged groups union mask pixels across many frames, so it
+    // must never run on every egui repaint.
+    shape_group_series_cache: Vec<ShapeGroupSeries>,
+    shape_group_series_cache_dirty: bool,
     next_track_id: u64,
     /// Set whenever a new sequence is opened/started. The first processed frame
     /// seeds one pivot for every closed connected mask component automatically.
@@ -1277,6 +1282,8 @@ impl GreenViewerApp {
             temporal_overlap_threshold: if persisted_v2 { persisted.temporal_overlap_threshold.clamp(0.0, 1.0) } else { 0.35 },
             track_overlap_threshold: if persisted_v2 { persisted.track_overlap_threshold.clamp(0.0, 1.0) } else { 0.30 },
             shape_tracks: Vec::new(),
+            shape_group_series_cache: Vec::new(),
+            shape_group_series_cache_dirty: true,
             next_track_id: 0,
             auto_seed_pivots_pending: false,
             shape_plot_open: if persisted_v2 { persisted.shape_plot_open } else { false },
@@ -1721,8 +1728,16 @@ impl GreenViewerApp {
         ctx: &egui::Context,
         schedule_processing: bool,
     ) {
+        let previous_dimensions = self
+            .original_rgba
+            .as_ref()
+            .map(|current| (current.width(), current.height()));
         let rgba = Arc::new(image.rgba);
         let gray = Arc::new(image.gray);
+        let new_dimensions = (rgba.width(), rgba.height());
+        if previous_dimensions != Some(new_dimensions) {
+            self.invalidate_shape_group_series_cache();
+        }
         self.original_texture = Some(ctx.load_texture(
             "original-image",
             rgba_to_color_image(rgba.as_ref()),
@@ -1763,7 +1778,7 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
-            version: 9,
+            version: 10,
             source_history: self.source_history.clone(),
             status_history: self
                 .status_history
@@ -1891,6 +1906,7 @@ impl GreenViewerApp {
         }
 
         self.shape_tracks = state.shape_tracks.into_iter().map(PersistedShapeTrack::into_track).collect();
+        self.invalidate_shape_group_series_cache();
         self.next_track_id = state
             .next_track_id
             .max(self.shape_tracks.iter().map(|track| track.id).max().unwrap_or(0));
@@ -1989,14 +2005,26 @@ impl GreenViewerApp {
         id
     }
 
-    fn sync_shape_series_metadata(&mut self) {
+    fn invalidate_shape_group_series_cache(&mut self) {
+        self.shape_group_series_cache_dirty = true;
+    }
+
+    fn ensure_shape_group_series_cache(&mut self) {
+        if !self.shape_group_series_cache_dirty {
+            return;
+        }
         let width = self
             .original_rgba
             .as_ref()
             .map(|image| image.width() as usize)
             .unwrap_or(0);
-        let groups = build_shape_group_series(&self.shape_tracks, width);
-        let active_keys = groups
+        self.shape_group_series_cache = build_shape_group_series(&self.shape_tracks, width);
+        self.shape_group_series_cache_dirty = false;
+    }
+
+    fn sync_shape_series_metadata(&mut self) {
+        self.ensure_shape_group_series_cache();
+        let active_keys = self.shape_group_series_cache
             .iter()
             .map(|group| shape_series_key(group.id))
             .collect::<BTreeSet<_>>();
@@ -2007,7 +2035,7 @@ impl GreenViewerApp {
         });
         let mut changed = self.series_meta.len() != before_len;
         let default_plot = self.default_plot_id();
-        for group in groups {
+        for group in &self.shape_group_series_cache {
             let key = shape_series_key(group.id);
             if !self.series_meta.contains_key(&key) {
                 self.series_meta.insert(key.clone(), SeriesMeta {
@@ -2192,20 +2220,12 @@ impl GreenViewerApp {
         }
     }
 
-    fn collect_plot_series_for_plot(&self, plot_id: u64) -> Vec<PlotSeriesData> {
-        let width = self
-            .original_rgba
-            .as_ref()
-            .map(|image| image.width() as usize)
-            .unwrap_or(0);
-        let shape_groups = build_shape_group_series(&self.shape_tracks, width)
-            .into_iter()
-            .map(|group| (group.id, group))
-            .collect::<BTreeMap<_, _>>();
+    fn collect_plot_series_for_plot(&mut self, plot_id: u64) -> Vec<PlotSeriesData> {
+        self.ensure_shape_group_series_cache();
         let mut result = Vec::new();
         for meta in self.series_meta.values().filter(|meta| meta.visible && meta.plot_id == plot_id) {
             if let Some(group_id) = parse_shape_series_key(&meta.key) {
-                let Some(group) = shape_groups.get(&group_id) else { continue; };
+                let Some(group) = self.shape_group_series_cache.iter().find(|group| group.id == group_id) else { continue; };
                 let Some(sequence) = self.active_sequence.as_ref() else { continue; };
                 let points = group
                     .areas
@@ -2292,6 +2312,7 @@ impl GreenViewerApp {
                 self.sequence_raw_mask_cache.clear();
                 self.sequence_mask_cache_order.clear();
                 self.shape_tracks.clear();
+                self.invalidate_shape_group_series_cache();
                 self.auto_track_highwater_frame = None;
                 self.auto_seed_pivots_pending = true;
                 self.shape_plot_open = false;
@@ -2603,6 +2624,7 @@ impl GreenViewerApp {
         self.sequence_raw_mask_cache.clear();
         self.sequence_mask_cache_order.clear();
         self.shape_tracks.clear();
+        self.invalidate_shape_group_series_cache();
         self.auto_track_highwater_frame = None;
         self.auto_seed_pivots_pending = true;
         self.ha_data.clear();
@@ -3291,6 +3313,7 @@ impl GreenViewerApp {
             }
             self.merge_colliding_shape_groups(frame_index);
         }
+        self.invalidate_shape_group_series_cache();
         self.sync_shape_series_metadata();
         self.mark_persistence_dirty();
     }
@@ -3352,6 +3375,7 @@ impl GreenViewerApp {
         }
         self.merge_colliding_shape_groups(frame_index);
         self.reconcile_auto_shape_tracks(frame_index, width, height, &components);
+        self.invalidate_shape_group_series_cache();
         self.sync_shape_series_metadata();
         self.mark_persistence_dirty();
     }
@@ -3616,6 +3640,7 @@ impl GreenViewerApp {
         for frame in cached_frames {
             self.merge_colliding_shape_groups(frame);
         }
+        self.invalidate_shape_group_series_cache();
         self.sync_shape_series_metadata();
         self.status = format!(
             "Automatically added {} pivot(s) from closed shapes in sequence frame 1.",
@@ -3754,6 +3779,7 @@ impl GreenViewerApp {
         if let Some(plot) = self.plot_windows.first_mut() {
             plot.open = true;
         }
+        self.invalidate_shape_group_series_cache();
         self.sync_shape_series_metadata();
         let samples = self
             .shape_tracks
@@ -3770,15 +3796,11 @@ impl GreenViewerApp {
         );
     }
 
-    fn track_overlays(&self) -> Vec<viewer::OverlayPoint> {
+    fn track_overlays(&mut self) -> Vec<viewer::OverlayPoint> {
+        self.ensure_shape_group_series_cache();
         let current_frame = self.active_sequence.as_ref().map(|sequence| sequence.selected);
-        let width = self
-            .original_rgba
-            .as_ref()
-            .map(|image| image.width() as usize)
-            .unwrap_or(0);
-        build_shape_group_series(&self.shape_tracks, width)
-            .into_iter()
+        self.shape_group_series_cache
+            .iter()
             .map(|group| {
                 let frame_for_value = current_frame.unwrap_or(group.anchor_frame);
                 let pixel = group
@@ -3993,6 +4015,7 @@ time: {}", format_absolute_time(timestamp)));
         self.ai_mask = None;
         self.ai_mask_rgba = None;
         self.ai_mask_texture = None;
+        self.invalidate_shape_group_series_cache();
         self.sync_shape_series_metadata();
         self.auto_seed_pivots_pending = self
             .active_sequence
@@ -4531,15 +4554,14 @@ time: {}", format_absolute_time(timestamp)));
         ui.small("Start new creates a fresh capture folder. Continue active sequence appends new frames to the currently open sequence and preserves its history/tracking. Capture acquisition is independent from mask processing: raw originals keep the requested interval even if YOLO/temporal processing is slower.");
 
         ui.separator();
-        ui.collapsing("Image windows", |ui| {
-            ui.checkbox(&mut self.original_view.open, "Show original");
-            ui.checkbox(&mut self.processed_view.open, "Show processed");
+        ui.collapsing("Image window tools", |ui| {
             ui.checkbox(&mut self.ai_view.open, "Show AI mask");
-            ui.small("Each window has independent pan/zoom. Trackpad gestures affect only the image under the pointer.");
+            ui.small("Original/Processed visibility is managed in Timeseries / plot windows. Each image window keeps independent pan/zoom.");
             if ui.button("Fit all independently").clicked() {
                 self.original_view.reset_fit();
                 self.processed_view.reset_fit();
                 self.ai_view.reset_fit();
+                self.mark_persistence_dirty();
             }
         });
 
@@ -4995,6 +5017,35 @@ time: {}", format_absolute_time(timestamp)));
             });
 
             ui.separator();
+            ui.label("Image windows");
+            ui.horizontal_wrapped(|ui| {
+                let mut original_open = self.original_view.open;
+                if ui.checkbox(&mut original_open, "Original").changed() {
+                    let opening = original_open && !self.original_view.open;
+                    self.original_view.open = original_open;
+                    if opening {
+                        self.original_view.reset_fit();
+                        self.original_view.window_pos = None;
+                        self.original_view.selection_start = None;
+                    }
+                    self.mark_persistence_dirty();
+                }
+
+                let mut processed_open = self.processed_view.open;
+                if ui.checkbox(&mut processed_open, "Processed").changed() {
+                    let opening = processed_open && !self.processed_view.open;
+                    self.processed_view.open = processed_open;
+                    if opening {
+                        self.processed_view.reset_fit();
+                        self.processed_view.window_pos = None;
+                        self.processed_view.selection_start = None;
+                    }
+                    self.mark_persistence_dirty();
+                }
+                ui.small("Opening from here resets that image window to its default position and Fit view; relaunch restores the last saved visibility/position/zoom.");
+            });
+
+            ui.separator();
             ui.label("Plot windows");
             let mut remove_plot = None;
             let can_remove_plot = self.plot_windows.len() > 1;
@@ -5235,6 +5286,7 @@ time: {}", format_absolute_time(timestamp)));
                 for frame in cached_frames {
                     self.merge_colliding_shape_groups(frame);
                 }
+                self.invalidate_shape_group_series_cache();
                 self.sync_shape_series_metadata();
                 self.save_preferences();
             }
@@ -5328,6 +5380,7 @@ time: {}", format_absolute_time(timestamp)));
                     .clicked()
                 {
                     self.shape_tracks.clear();
+                    self.invalidate_shape_group_series_cache();
                     self.sync_shape_series_metadata();
                 }
             });
@@ -5336,9 +5389,10 @@ time: {}", format_absolute_time(timestamp)));
                 *group_counts.entry(track.group_id).or_default() += 1;
             }
             let mut remove_track = None;
+            let mut track_ui_changed = false;
             for (index, track) in self.shape_tracks.iter_mut().enumerate() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut track.enabled, "");
+                    let enabled_changed = ui.checkbox(&mut track.enabled, "").changed();
                     let grouped = group_counts.get(&track.group_id).copied().unwrap_or(1);
                     ui.colored_label(
                         shape_series_color(track.group_id),
@@ -5348,7 +5402,10 @@ time: {}", format_absolute_time(timestamp)));
                             format!("T{}", track.id)
                         },
                     );
-                    ui.text_edit_singleline(&mut track.name);
+                    let name_changed = ui.text_edit_singleline(&mut track.name).changed();
+                    if enabled_changed || name_changed {
+                        track_ui_changed = true;
+                    }
                     ui.monospace(format!(
                         "{} samples · anchor f{} @ {},{}",
                         track.observations.len(),
@@ -5361,8 +5418,14 @@ time: {}", format_absolute_time(timestamp)));
                     }
                 });
             }
+            if track_ui_changed {
+                self.invalidate_shape_group_series_cache();
+                self.sync_shape_series_metadata();
+                self.mark_persistence_dirty();
+            }
             if let Some(index) = remove_track {
                 self.shape_tracks.remove(index);
+                self.invalidate_shape_group_series_cache();
                 self.sync_shape_series_metadata();
             }
         });
@@ -5384,7 +5447,11 @@ time: {}", format_absolute_time(timestamp)));
             egui::pos2(470.0, 60.0),
         );
 
-        let overlays = self.track_overlays();
+        let overlays = if self.processed_view.open {
+            self.track_overlays()
+        } else {
+            Vec::new()
+        };
         let processed_interaction = viewer::show_floating_image_window(
             &ctx,
             "Processed — final plant mask",
@@ -5403,6 +5470,7 @@ time: {}", format_absolute_time(timestamp)));
             self.shape_tracks.retain(|track| track.group_id != group_id);
             let removed = before.saturating_sub(self.shape_tracks.len());
             if removed > 0 {
+                self.invalidate_shape_group_series_cache();
                 self.sync_shape_series_metadata();
                 self.status = if removed == 1 {
                     format!("Removed tracked pivot T{group_id}.")
@@ -5687,11 +5755,32 @@ time: {}", format_absolute_time(timestamp)));
 
                     let data_painter = painter.with_clip_rect(rect);
                     let plot_hover = plot_response.hover_pos().filter(|pos| rect.contains(*pos));
+                    let visible_start_time = start_time + Duration::from_secs_f64(full_span.as_secs_f64() * x_min);
+                    let visible_end_time = start_time + Duration::from_secs_f64(full_span.as_secs_f64() * x_max);
                     let mut hovered: Option<(f32, usize, usize, egui::Pos2)> = None;
                     for (series_index, item) in series.iter().enumerate() {
                         let color = series_color(item.color_seed);
-                        let mut points = Vec::with_capacity(item.points.len());
-                        for (point_index, point) in item.points.iter().enumerate() {
+                        // Work only on points near the visible time range, then cap
+                        // geometry to screen resolution. Stored data is untouched, so
+                        // zooming in reveals more detail instead of permanently thinning it.
+                        let first_visible = item
+                            .points
+                            .partition_point(|point| point.time < visible_start_time)
+                            .saturating_sub(1);
+                        let last_visible = item
+                            .points
+                            .partition_point(|point| point.time <= visible_end_time)
+                            .saturating_add(1)
+                            .min(item.points.len());
+                        if first_visible >= last_visible {
+                            continue;
+                        }
+                        let visible_points = &item.points[first_visible..last_visible];
+                        let max_render_points = ((rect.width().max(1.0) as usize) * 4).max(512);
+                        let render_stride = (visible_points.len() / max_render_points).max(1);
+                        let mut points = Vec::with_capacity(visible_points.len().min(max_render_points + 2));
+                        for (offset, point) in visible_points.iter().enumerate().step_by(render_stride) {
+                            let point_index = first_visible + offset;
                             let Some(x) = x_for_time(point.time) else { continue; };
                             let y = y_for_value(point.value);
                             let screen = egui::pos2(x, y);
@@ -5703,6 +5792,26 @@ time: {}", format_absolute_time(timestamp)));
                                         && hovered.as_ref().is_none_or(|current| distance_sq < current.0)
                                     {
                                         hovered = Some((distance_sq, series_index, point_index, screen));
+                                    }
+                                }
+                            }
+                        }
+                        if render_stride > 1
+                            && let Some((last_offset, point)) = visible_points.iter().enumerate().next_back()
+                            && last_offset % render_stride != 0
+                        {
+                            let point_index = first_visible + last_offset;
+                            if let Some(x) = x_for_time(point.time) {
+                                let screen = egui::pos2(x, y_for_value(point.value));
+                                points.push(screen);
+                                if rect.contains(screen) {
+                                    if let Some(pointer) = plot_hover {
+                                        let distance_sq = screen.distance_sq(pointer);
+                                        if distance_sq <= 9.0 * 9.0
+                                            && hovered.as_ref().is_none_or(|current| distance_sq < current.0)
+                                        {
+                                            hovered = Some((distance_sq, series_index, point_index, screen));
+                                        }
                                     }
                                 }
                             }
@@ -5959,7 +6068,7 @@ fn source_loop(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.8.9")
+        .user_agent("rust-edge-gui/0.9.0")
         .build()
         .expect("failed to build HTTP client");
 
@@ -5990,7 +6099,7 @@ fn source_loop(
                     let capture_client = reqwest::blocking::Client::builder()
                         .connect_timeout(connect_timeout)
                         .timeout(request_timeout)
-                        .user_agent("rust-edge-gui/0.8.9")
+                        .user_agent("rust-edge-gui/0.9.0")
                         .build()
                         .context("failed to build capture HTTP client")?;
                     network_manager::with_capture_network(network.as_ref(), &url, || {

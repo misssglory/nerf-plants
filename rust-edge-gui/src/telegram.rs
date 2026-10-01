@@ -101,7 +101,7 @@ impl TelegramNotifier {
                 let client = match reqwest::blocking::Client::builder()
                     .connect_timeout(Duration::from_secs(5))
                     .timeout(Duration::from_secs(15))
-                    .user_agent("rust-edge-gui/0.8.9")
+                    .user_agent("rust-edge-gui/0.9.0")
                     .build()
                 {
                     Ok(client) => client,

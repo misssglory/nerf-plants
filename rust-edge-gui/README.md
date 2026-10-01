@@ -1,6 +1,18 @@
-# rust-edge-gui 0.8.8
+# rust-edge-gui 0.9.0
 
 Rust/egui plant-mask viewer and timeseries dashboard for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, native offline YOLO segmentation, temporal filtering, automatic plant/leaf tracking, multiple resizable plots, and external Home Assistant sensor timeseries.
+
+## What changed in 0.9.0
+
+- **Timeseries / plot windows** now also contains visibility toggles for **Original** and **Processed** image windows.
+- Turning one of those windows back on resets that window to its default position and **Fit** pan/zoom. Relaunch is different: persisted visibility, position, size, pan and zoom are restored exactly instead of being reset.
+- Long paused sequences are substantially cheaper to render. Previously, merged shape-area/centroid series were rebuilt from tracked mask pixels every GUI repaint (including while playback was paused), and Processed pivot overlays triggered the same expensive rebuild again. v0.9.0 caches this derived data until masks/tracking actually change.
+- Hidden Processed windows no longer build pivot overlays.
+- Dense plots render an adaptive subset (up to roughly four samples per horizontal pixel, plus the final sample) while all original timeseries values remain stored for hover/analysis and future zoomed views.
+
+### Why paused long sequences used to lag
+
+Playback pause only stopped advancing frames. It did **not** stop normal egui repaints. Before v0.9.0 each repaint called `build_shape_group_series`, which unioned `matched_pixels` into `BTreeSet`s for every tracked group and frame. With many frames/shapes this became proportional to the amount of mask geometry rather than the current view. Open plots also drew every stored sample every repaint. The new derived-series cache removes the mask-union hot path from ordinary paused repaints, and dense plot rendering is capped to screen resolution.
 
 ## What changed in 0.8.8
 
