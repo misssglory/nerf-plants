@@ -3,6 +3,8 @@ mod yolo;
 mod home_assistant;
 mod telegram;
 mod network_manager;
+mod frame_cache;
+mod mqtt;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -25,8 +27,10 @@ use yolo::{
 use home_assistant::{HaMessage, HaRequest, HaRequestKind, HaSeriesRequest, HaWorker};
 use telegram::{load_telegram_config, TelegramConfig, TelegramNotifier};
 use network_manager::{CaptureNetworkRequest, SavedWifiProfile};
+use frame_cache::{FrameMemoryCache, spawn_sequence_prefetch};
+use mqtt::{MqttMessage, MqttPublishConfig, MqttRequest, MqttWorker, PumpCommand};
 
-const APP_TITLE: &str = "Rust Edge GUI v0.9.0 — Cached Long-Sequence Rendering";
+const APP_TITLE: &str = "Rust Edge GUI v0.9.2 — MQTT Pump Control";
 const MAX_HISTORY: usize = 20;
 const MIN_CAPTURE_INTERVAL_SECONDS: f32 = 0.1;
 const MAX_SEQUENCE_MASK_CACHE: usize = 64;
@@ -261,7 +265,7 @@ struct SourceWorker {
 }
 
 impl SourceWorker {
-    fn spawn(repaint_ctx: egui::Context) -> Self {
+    fn spawn(repaint_ctx: egui::Context, frame_cache: FrameMemoryCache) -> Self {
         let (tx, job_rx) = mpsc::channel::<(u64, SourceRequest)>();
         let (message_tx, rx) = mpsc::channel::<SourceMessage>();
         let latest_id = Arc::new(AtomicU64::new(0));
@@ -269,7 +273,7 @@ impl SourceWorker {
 
         let worker = thread::Builder::new()
             .name("image-source-worker".to_owned())
-            .spawn(move || source_loop(job_rx, message_tx, worker_latest, repaint_ctx))
+            .spawn(move || source_loop(job_rx, message_tx, worker_latest, repaint_ctx, frame_cache))
             .expect("failed to spawn source worker");
 
         Self {
@@ -641,6 +645,28 @@ struct PersistedState {
     ha_history_hours: f32,
     #[serde(default)]
     ha_series: Vec<HaSeriesConfig>,
+    #[serde(default)]
+    pump_mqtt_host: String,
+    #[serde(default)]
+    pump_mqtt_port: u16,
+    #[serde(default)]
+    pump_mqtt_username: String,
+    #[serde(default)]
+    pump_mqtt_password: String,
+    #[serde(default)]
+    pump_mqtt_remember_password: bool,
+    #[serde(default)]
+    pump_mqtt_topic: String,
+    #[serde(default)]
+    pump_auto_enabled: bool,
+    #[serde(default)]
+    pump_moisture_series_key: String,
+    #[serde(default)]
+    pump_run_seconds: f32,
+    #[serde(default)]
+    pump_on_threshold: f32,
+    #[serde(default)]
+    pump_off_threshold: f32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -757,6 +783,8 @@ struct SequenceAnalysisState {
     ha_series: Vec<HaSeriesConfig>,
     #[serde(default)]
     ha_data: Vec<PersistedHaSeriesData>,
+    #[serde(default)]
+    pump_status_points: Vec<PersistedSeriesPoint>,
 }
 
 struct ImageSequence {
@@ -862,6 +890,10 @@ struct GreenViewerApp {
     next_source_id: u64,
     active_source_id: u64,
     source_loading: bool,
+    /// LZ4-compressed decoded sequence frames kept in RAM for fast playback.
+    frame_cache: FrameMemoryCache,
+    frame_cache_generation: Arc<AtomicU64>,
+    repaint_ctx: egui::Context,
 
     settings: GreenSettings,
     detection_mode: DetectionMode,
@@ -967,8 +999,32 @@ struct GreenViewerApp {
     ha_data: BTreeMap<String, HaSeriesData>,
     ha_request_id: u64,
     ha_request_pending: bool,
+    ha_request_history: bool,
     next_ha_poll: Option<Instant>,
     ha_status: String,
+
+    mqtt_worker: MqttWorker,
+    pump_mqtt_host_input: String,
+    pump_mqtt_port: u16,
+    pump_mqtt_username_input: String,
+    pump_mqtt_password_input: String,
+    pump_mqtt_remember_password: bool,
+    pump_mqtt_topic_input: String,
+    pump_auto_enabled: bool,
+    pump_moisture_series_key: String,
+    pump_run_seconds: f32,
+    pump_on_threshold: f32,
+    pump_off_threshold: f32,
+    pump_is_on: bool,
+    pump_command_pending: Option<PumpCommand>,
+    pump_command_id: u64,
+    pump_off_deadline: Option<Instant>,
+    pump_off_retry_due: Option<Instant>,
+    pump_off_requested: bool,
+    pump_last_evaluated_sample: Option<SystemTime>,
+    pump_last_moisture: Option<f64>,
+    pump_status_points: BTreeMap<SystemTime, f64>,
+    pump_status: String,
 
     telegram_config: TelegramConfig,
     telegram_notifier: TelegramNotifier,
@@ -1016,6 +1072,7 @@ impl GreenViewerApp {
         let persisted_v3 = persisted.version >= 3;
         let persisted_v4 = persisted.version >= 4;
         let persisted_v5 = persisted.version >= 5;
+        let persisted_v11 = persisted.version >= 11;
         let image_history_input = if persisted_v2 && !persisted.image_history_input.is_empty() {
             persisted.image_history_input.clone()
         } else {
@@ -1188,6 +1245,32 @@ impl GreenViewerApp {
         } else {
             24.0
         };
+        let pump_mqtt_host_input = if persisted.pump_mqtt_host.trim().is_empty() {
+            "127.0.0.1".to_owned()
+        } else {
+            persisted.pump_mqtt_host.clone()
+        };
+        let pump_mqtt_port = if persisted.pump_mqtt_port == 0 { 1883 } else { persisted.pump_mqtt_port };
+        let pump_mqtt_topic_input = if persisted.pump_mqtt_topic.trim().is_empty() {
+            "pump/mode/set".to_owned()
+        } else {
+            persisted.pump_mqtt_topic.clone()
+        };
+        let pump_run_seconds = if persisted_v11 {
+            persisted.pump_run_seconds.clamp(0.1, 86_400.0)
+        } else {
+            10.0
+        };
+        let pump_on_threshold = if persisted_v11 {
+            persisted.pump_on_threshold.clamp(0.0, 100.0)
+        } else {
+            30.0
+        };
+        let pump_off_threshold = if persisted_v11 {
+            persisted.pump_off_threshold.clamp(0.0, 100.0)
+        } else {
+            45.0
+        };
 
         let (telegram_config, telegram_config_status) = load_telegram_config();
         let telegram_notifier = TelegramNotifier::spawn(&telegram_config);
@@ -1196,6 +1279,7 @@ impl GreenViewerApp {
         let mut loaded_status_history = persisted
             .status_history
             .iter()
+            .filter(|entry| entry.is_error || !is_transient_frame_loading_status(&entry.text))
             .filter_map(|entry| {
                 UNIX_EPOCH
                     .checked_add(Duration::from_millis(entry.timestamp_ms))
@@ -1215,6 +1299,9 @@ impl GreenViewerApp {
             is_error: false,
         });
 
+        let frame_cache = FrameMemoryCache::default();
+        let frame_cache_generation = Arc::new(AtomicU64::new(1));
+
         let mut app = Self {
             original_rgba: None,
             original_gray: None,
@@ -1228,10 +1315,13 @@ impl GreenViewerApp {
             sequence_history: persisted.sequence_history,
             sequence_history_input,
             active_sequence: None,
-            source_worker: SourceWorker::spawn(cc.egui_ctx.clone()),
+            source_worker: SourceWorker::spawn(cc.egui_ctx.clone(), frame_cache.clone()),
             next_source_id: 0,
             active_source_id: 0,
             source_loading: false,
+            frame_cache,
+            frame_cache_generation,
+            repaint_ctx: cc.egui_ctx.clone(),
             settings,
             detection_mode,
             dirty: false,
@@ -1316,8 +1406,31 @@ impl GreenViewerApp {
             ha_data: BTreeMap::new(),
             ha_request_id: 0,
             ha_request_pending: false,
+            ha_request_history: false,
             next_ha_poll: None,
             ha_status: "Home Assistant idle".to_owned(),
+            mqtt_worker: MqttWorker::spawn(cc.egui_ctx.clone()),
+            pump_mqtt_host_input,
+            pump_mqtt_port,
+            pump_mqtt_username_input: persisted.pump_mqtt_username.clone(),
+            pump_mqtt_password_input: if persisted.pump_mqtt_remember_password { persisted.pump_mqtt_password.clone() } else { String::new() },
+            pump_mqtt_remember_password: persisted.pump_mqtt_remember_password,
+            pump_mqtt_topic_input,
+            pump_auto_enabled: persisted.pump_auto_enabled,
+            pump_moisture_series_key: persisted.pump_moisture_series_key.clone(),
+            pump_run_seconds,
+            pump_on_threshold,
+            pump_off_threshold,
+            pump_is_on: false,
+            pump_command_pending: None,
+            pump_command_id: 0,
+            pump_off_deadline: None,
+            pump_off_retry_due: None,
+            pump_off_requested: false,
+            pump_last_evaluated_sample: None,
+            pump_last_moisture: None,
+            pump_status_points: BTreeMap::new(),
+            pump_status: "Pump idle / assumed OFF".to_owned(),
             telegram_config,
             telegram_notifier,
             telegram_config_status,
@@ -1350,6 +1463,7 @@ impl GreenViewerApp {
         };
 
         app.sync_home_assistant_series_metadata();
+        app.sync_pump_series_metadata();
         app.next_selection_group_id = app
             .series_meta
             .values()
@@ -1392,6 +1506,14 @@ impl GreenViewerApp {
             return;
         }
         let now = SystemTime::now();
+        if !is_error && is_transient_frame_loading_status(&text) {
+            // Frame-by-frame playback/loading is intentionally omitted from the
+            // persistent status history. Otherwise a long sequence floods useful
+            // capture/processing/error events with two log lines per frame.
+            self.status_changed_at = now;
+            self.last_status_signature = signature;
+            return;
+        }
         self.status_changed_at = now;
         self.last_status_signature = signature;
         self.status_history.push_back(StatusEvent { time: now, text, is_error });
@@ -1542,6 +1664,7 @@ impl GreenViewerApp {
             &request,
             SourceRequest::File(_) | SourceRequest::Url(_)
         ) {
+            self.clear_sequence_frame_cache();
             self.active_sequence = None;
             self.sequence_playing = false;
             self.next_sequence_frame_due = None;
@@ -1778,7 +1901,7 @@ impl GreenViewerApp {
 
     fn save_preferences(&self) {
         save_persisted_state(&PersistedState {
-            version: 10,
+            version: 11,
             source_history: self.source_history.clone(),
             status_history: self
                 .status_history
@@ -1847,6 +1970,17 @@ impl GreenViewerApp {
             ha_poll_interval_secs: self.ha_poll_interval_secs,
             ha_history_hours: self.ha_history_hours,
             ha_series: self.ha_series.clone(),
+            pump_mqtt_host: self.pump_mqtt_host_input.clone(),
+            pump_mqtt_port: self.pump_mqtt_port,
+            pump_mqtt_username: self.pump_mqtt_username_input.clone(),
+            pump_mqtt_password: if self.pump_mqtt_remember_password { self.pump_mqtt_password_input.clone() } else { String::new() },
+            pump_mqtt_remember_password: self.pump_mqtt_remember_password,
+            pump_mqtt_topic: self.pump_mqtt_topic_input.clone(),
+            pump_auto_enabled: self.pump_auto_enabled,
+            pump_moisture_series_key: self.pump_moisture_series_key.clone(),
+            pump_run_seconds: self.pump_run_seconds,
+            pump_on_threshold: self.pump_on_threshold,
+            pump_off_threshold: self.pump_off_threshold,
         });
         if let Err(error) = self.save_active_sequence_state() {
             eprintln!("warning: failed to persist sequence analysis state: {error:#}");
@@ -1889,6 +2023,14 @@ impl GreenViewerApp {
             next_selection_group_id: self.next_selection_group_id,
             ha_series: self.ha_series.clone(),
             ha_data,
+            pump_status_points: self
+                .pump_status_points
+                .iter()
+                .map(|(&time, &value)| PersistedSeriesPoint {
+                    timestamp_ms: system_time_to_millis(time),
+                    value,
+                })
+                .collect(),
         };
         write_sequence_analysis_state(&sequence.root, &state)
     }
@@ -1959,7 +2101,13 @@ impl GreenViewerApp {
                 },
             );
         }
+        self.pump_status_points = state
+            .pump_status_points
+            .into_iter()
+            .filter_map(|point| millis_to_system_time(point.timestamp_ms).map(|time| (time, point.value)))
+            .collect();
         self.sync_home_assistant_series_metadata();
+        self.sync_pump_series_metadata();
         self.sync_shape_series_metadata();
         self.auto_seed_pivots_pending = self.shape_tracks.is_empty();
         self.shape_plot_open = self.plot_windows.iter().any(|plot| plot.open);
@@ -2074,6 +2222,24 @@ impl GreenViewerApp {
         self.series_meta.retain(|key, _| !key.starts_with("ha:") || configured.contains(key));
     }
 
+    fn sync_pump_series_metadata(&mut self) {
+        let key = pump_series_key().to_owned();
+        if !self.series_meta.contains_key(&key) {
+            let default_plot = self.default_plot_id();
+            self.series_meta.insert(
+                key.clone(),
+                SeriesMeta {
+                    key,
+                    name: "Pump status".to_owned(),
+                    group: "Pump".to_owned(),
+                    plot_id: default_plot,
+                    visible: true,
+                },
+            );
+            self.mark_persistence_dirty();
+        }
+    }
+
     fn group_selected_shape_series(&mut self, group_ids: &[u64]) {
         if group_ids.is_empty() {
             return;
@@ -2131,6 +2297,7 @@ impl GreenViewerApp {
             return;
         }
         self.ha_request_id = self.ha_request_id.wrapping_add(1).max(1);
+        let request_is_history = matches!(&kind, HaRequestKind::History { .. });
         let request = HaRequest {
             id: self.ha_request_id,
             base_url: self.ha_base_url_input.trim().to_owned(),
@@ -2149,6 +2316,7 @@ impl GreenViewerApp {
         match self.ha_worker.request_tx.send(request) {
             Ok(()) => {
                 self.ha_request_pending = true;
+                self.ha_request_history = request_is_history;
                 self.ha_status = "Home Assistant request in progress…".to_owned();
             }
             Err(error) => {
@@ -2192,15 +2360,207 @@ impl GreenViewerApp {
                             }
                         }
                     }
+                    if self.ha_request_history {
+                        self.pump_last_evaluated_sample = self
+                            .latest_pump_moisture_sample()
+                            .map(|(time, _)| time);
+                    }
+                    self.ha_request_history = false;
                     self.ha_status = format!("Home Assistant: received {sample_count} sample(s).");
                     self.mark_persistence_dirty();
                 }
                 HaMessage::Failed { id, error } if id == self.ha_request_id || id == 0 => {
                     self.ha_request_pending = false;
+                    self.ha_request_history = false;
                     self.ha_status = format!("Home Assistant error: {error}");
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn queue_pump_command(&mut self, command: PumpCommand) {
+        if let Some(pending) = self.pump_command_pending {
+            if command == PumpCommand::Off && pending != PumpCommand::Off {
+                self.pump_off_requested = true;
+                self.pump_status = "OFF queued after pending MQTT command".to_owned();
+            }
+            return;
+        }
+        let host = self.pump_mqtt_host_input.trim().to_owned();
+        let topic = self.pump_mqtt_topic_input.trim().to_owned();
+        if host.is_empty() || topic.is_empty() {
+            self.pump_status = "MQTT host/topic is missing".to_owned();
+            self.error = Some(self.pump_status.clone());
+            return;
+        }
+        self.pump_command_id = self.pump_command_id.wrapping_add(1).max(1);
+        let request = MqttRequest {
+            id: self.pump_command_id,
+            config: MqttPublishConfig {
+                host,
+                port: self.pump_mqtt_port.max(1),
+                username: self.pump_mqtt_username_input.trim().to_owned(),
+                password: self.pump_mqtt_password_input.clone(),
+                topic,
+                timeout: Duration::from_secs(5),
+            },
+            command,
+        };
+        match self.mqtt_worker.request_tx.send(request) {
+            Ok(()) => {
+                self.pump_command_pending = Some(command);
+                self.pump_status = format!("MQTT {} pending…", command.label());
+            }
+            Err(error) => {
+                self.pump_status = format!("MQTT worker unavailable: {error}");
+                self.error = Some(self.pump_status.clone());
+                if command == PumpCommand::Off {
+                    self.pump_off_requested = true;
+                    self.pump_off_retry_due = Some(Instant::now() + Duration::from_secs(2));
+                }
+            }
+        }
+    }
+
+    fn record_pump_status(&mut self, on: bool) {
+        let now = SystemTime::now();
+        let value = if on { 1.0 } else { 0.0 };
+        let previous = self.pump_status_points.iter().next_back().map(|(_, value)| *value);
+        if let Some(previous) = previous {
+            if (previous - value).abs() > f64::EPSILON {
+                if let Some(before) = now.checked_sub(Duration::from_millis(1)) {
+                    self.pump_status_points.insert(before, previous);
+                }
+            }
+        } else if on {
+            if let Some(before) = now.checked_sub(Duration::from_millis(1)) {
+                self.pump_status_points.insert(before, 0.0);
+            }
+        }
+        self.pump_status_points.insert(now, value);
+        while self.pump_status_points.len() > MAX_EXTERNAL_SERIES_POINTS {
+            let Some(oldest) = self.pump_status_points.keys().next().copied() else { break; };
+            self.pump_status_points.remove(&oldest);
+        }
+        self.sync_pump_series_metadata();
+        self.mark_persistence_dirty();
+    }
+
+    fn poll_mqtt_worker(&mut self) {
+        while let Ok(message) = self.mqtt_worker.message_rx.try_recv() {
+            match message {
+                MqttMessage::Finished { id, command } if id == self.pump_command_id => {
+                    self.pump_command_pending = None;
+                    self.pump_off_retry_due = None;
+                    match command {
+                        PumpCommand::Forward => {
+                            self.pump_is_on = true;
+                            self.record_pump_status(true);
+                            self.pump_off_deadline = Some(
+                                Instant::now() + Duration::from_secs_f32(self.pump_run_seconds.max(0.1)),
+                            );
+                            self.pump_status = format!(
+                                "Pump ON for up to {:.1} s",
+                                self.pump_run_seconds.max(0.1)
+                            );
+                            self.status = self.pump_status.clone();
+                            if self.pump_off_requested {
+                                self.queue_pump_command(PumpCommand::Off);
+                            }
+                        }
+                        PumpCommand::Off => {
+                            self.pump_is_on = false;
+                            self.pump_off_deadline = None;
+                            self.pump_off_requested = false;
+                            self.record_pump_status(false);
+                            self.pump_status = "Pump OFF".to_owned();
+                            self.status = self.pump_status.clone();
+                        }
+                    }
+                }
+                MqttMessage::Failed { id, command, error } if id == self.pump_command_id => {
+                    self.pump_command_pending = None;
+                    self.pump_status = format!("MQTT {} failed: {error}", command.label());
+                    self.error = Some(self.pump_status.clone());
+                    match command {
+                        PumpCommand::Off => {
+                            self.pump_off_requested = true;
+                            self.pump_off_retry_due = Some(Instant::now() + Duration::from_secs(2));
+                        }
+                        PumpCommand::Forward => {
+                            // QoS1 failure can still be ambiguous (the broker may have received
+                            // the publish before the connection failed), so fail safe toward OFF.
+                            self.pump_off_requested = true;
+                            self.pump_off_retry_due = Some(Instant::now());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn latest_pump_moisture_sample(&self) -> Option<(SystemTime, f64)> {
+        let key = self.pump_moisture_series_key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        self.ha_data
+            .get(key)?
+            .points
+            .iter()
+            .next_back()
+            .map(|(&time, &value)| (time, value))
+    }
+
+    fn tick_pump_control(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if let Some(deadline) = self.pump_off_deadline {
+            if now >= deadline {
+                self.pump_off_deadline = None;
+                self.pump_off_requested = true;
+                self.queue_pump_command(PumpCommand::Off);
+            } else {
+                ctx.request_repaint_after(deadline.saturating_duration_since(now).min(Duration::from_secs(1)));
+            }
+        }
+        if let Some(retry_due) = self.pump_off_retry_due {
+            if now >= retry_due && self.pump_command_pending.is_none() {
+                self.queue_pump_command(PumpCommand::Off);
+            } else {
+                ctx.request_repaint_after(retry_due.saturating_duration_since(now).min(Duration::from_secs(1)));
+            }
+        }
+
+        if !self.pump_auto_enabled {
+            return;
+        }
+        if self.pump_off_threshold <= self.pump_on_threshold {
+            self.pump_status = "Auto pump disabled by invalid thresholds: OFF must be above ON".to_owned();
+            return;
+        }
+        let Some((sample_time, moisture)) = self.latest_pump_moisture_sample() else {
+            return;
+        };
+        self.pump_last_moisture = Some(moisture);
+        if self.pump_last_evaluated_sample == Some(sample_time) {
+            return;
+        }
+        self.pump_last_evaluated_sample = Some(sample_time);
+
+        if moisture >= self.pump_off_threshold as f64 {
+            self.pump_off_requested = true;
+            self.queue_pump_command(PumpCommand::Off);
+        } else if moisture < self.pump_on_threshold as f64 {
+            if !self.pump_is_on && self.pump_command_pending.is_none() && !self.pump_off_requested {
+                self.queue_pump_command(PumpCommand::Forward);
+            }
+        } else {
+            self.pump_status = format!(
+                "Moisture {:.1}% in hysteresis band {:.1}–{:.1}% · no state change",
+                moisture, self.pump_on_threshold, self.pump_off_threshold
+            );
         }
     }
 
@@ -2262,6 +2622,22 @@ impl GreenViewerApp {
                         points,
                     });
                 }
+            } else if meta.key == pump_series_key() {
+                let points = self
+                    .pump_status_points
+                    .iter()
+                    .map(|(&time, &value)| PlotPoint { time, value, frame: None })
+                    .collect::<Vec<_>>();
+                if !points.is_empty() {
+                    result.push(PlotSeriesData {
+                        key: meta.key.clone(),
+                        name: meta.name.clone(),
+                        group: meta.group.clone(),
+                        unit: String::new(),
+                        color_seed: stable_series_seed(&meta.key),
+                        points,
+                    });
+                }
             }
         }
         result
@@ -2290,6 +2666,44 @@ impl GreenViewerApp {
         }
     }
 
+    fn clear_sequence_frame_cache(&mut self) {
+        self.frame_cache_generation.fetch_add(1, Ordering::AcqRel);
+        self.frame_cache.clear();
+    }
+
+    fn prefetch_active_sequence_frames(&mut self) {
+        self.frame_cache.clear();
+        self.prefetch_missing_active_sequence_frames();
+    }
+
+    fn prefetch_missing_active_sequence_frames(&mut self) {
+        let generation = self
+            .frame_cache_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let paths = self
+            .active_sequence
+            .as_ref()
+            .map(|sequence| {
+                sequence
+                    .frames
+                    .iter()
+                    .map(|frame| frame.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            return;
+        }
+        spawn_sequence_prefetch(
+            paths,
+            self.frame_cache.clone(),
+            Arc::clone(&self.frame_cache_generation),
+            generation,
+            self.repaint_ctx.clone(),
+        );
+    }
+
     fn open_sequence_from_history_field(&mut self) {
         let value = self.sequence_history_input.trim().to_owned();
         if value.is_empty() {
@@ -2304,6 +2718,7 @@ impl GreenViewerApp {
                 let selected_path = sequence.frames[sequence.selected].path.clone();
                 let root_label = sequence.root.display().to_string();
                 self.active_sequence = Some(sequence);
+                self.prefetch_active_sequence_frames();
                 self.sequence_playing = false;
                 self.next_sequence_frame_due = None;
                 self.current_final_mask = None;
@@ -2316,6 +2731,8 @@ impl GreenViewerApp {
                 self.auto_track_highwater_frame = None;
                 self.auto_seed_pivots_pending = true;
                 self.shape_plot_open = false;
+                self.pump_last_evaluated_sample = None;
+                self.pump_last_moisture = None;
 
                 let restored_analysis = match self.restore_sequence_analysis_state(&root) {
                     Ok(restored) => restored,
@@ -2329,8 +2746,10 @@ impl GreenViewerApp {
                     // app-level HA sensor configuration as a convenient template, but do not
                     // inherit numeric samples from a different sequence.
                     self.ha_data.clear();
+                    self.pump_status_points.clear();
                     self.series_meta.clear();
                     self.sync_home_assistant_series_metadata();
+                    self.sync_pump_series_metadata();
                     self.sync_shape_series_metadata();
                 }
                 self.remember_sequence(root_label.clone());
@@ -2616,6 +3035,7 @@ impl GreenViewerApp {
             frames: Vec::new(),
             selected: 0,
         });
+        self.clear_sequence_frame_cache();
         self.sequence_playing = false;
         self.next_sequence_frame_due = None;
         self.current_final_mask = None;
@@ -2858,10 +3278,12 @@ impl GreenViewerApp {
             (session.original_dir.join(&pending.file_name), pending.captured_at)
         };
         let image = self.original_rgba.as_ref()?.as_ref().clone();
-        if let Err(error) = DynamicImage::ImageRgba8(image).save(&path) {
+        let gray = self.original_gray.as_ref()?.as_ref().clone();
+        if let Err(error) = image.save(&path) {
             self.error = Some(format!("Failed to save capture {}: {error}", path.display()));
             return None;
         }
+        let _ = self.frame_cache.insert(path.clone(), &image, &gray);
         let index = self.append_capture_to_sequence(path, captured_at);
         if let (Some(index), Some(pending)) = (index, self.pending_capture.as_mut()) {
             pending.sequence_frame_index = Some(index);
@@ -3892,6 +4314,7 @@ time: {}", format_absolute_time(timestamp)));
             ));
             return;
         }
+        self.frame_cache.remove(&frame_path);
 
         // Captured sequences normally use the same filename in original/ and processed/.
         // Remove the counterpart as well so deleting one timeline frame cannot leave a stale
@@ -4031,6 +4454,9 @@ time: {}", format_absolute_time(timestamp)));
         }
         self.status = status;
         self.error = None;
+        // Stop any old prefetch that may still be decoding the deleted path and
+        // continue warming only the surviving sequence frames.
+        self.prefetch_missing_active_sequence_frames();
 
         if let Some(path) = next_path {
             self.queue_source(SourceRequest::SequenceFrame(path));
@@ -4158,20 +4584,31 @@ time: {}", format_absolute_time(timestamp)));
         ui.separator();
         self.timeseries_controls(ui);
         self.home_assistant_controls(ui);
+        self.pump_controls(ui);
 
         ui.separator();
         ui.collapsing("Status", |ui| {
             let current_time = format_status_time(self.status_changed_at);
-            if let Some(error) = self.error.as_ref() {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    format!("[{current_time}] {error}"),
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("[{current_time}]"))
+                        .monospace()
+                        .color(status_time_color()),
                 );
+                if let Some(error) = self.error.as_ref() {
+                    ui.label(
+                        egui::RichText::new(error)
+                            .monospace()
+                            .color(egui::Color32::LIGHT_RED),
+                    );
+                } else {
+                    ui.monospace(&self.status);
+                }
+            });
+            if let Some(error) = self.error.as_ref() {
                 if self.status != *error {
                     ui.monospace(format!("state: {}", self.status));
                 }
-            } else {
-                ui.monospace(format!("[{current_time}] {}", self.status));
             }
 
             if self.source_loading {
@@ -4200,12 +4637,22 @@ time: {}", format_absolute_time(timestamp)));
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         for entry in self.status_history.iter() {
-                            let text = format!("[{}] {}", format_status_time(entry.time), entry.text);
-                            if entry.is_error {
-                                ui.colored_label(egui::Color32::LIGHT_RED, text);
-                            } else {
-                                ui.monospace(text);
-                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("[{}]", format_status_time(entry.time)))
+                                        .monospace()
+                                        .color(status_time_color()),
+                                );
+                                if entry.is_error {
+                                    ui.label(
+                                        egui::RichText::new(&entry.text)
+                                            .monospace()
+                                            .color(egui::Color32::LIGHT_RED),
+                                    );
+                                } else {
+                                    ui.monospace(&entry.text);
+                                }
+                            });
                         }
                     });
             });
@@ -4956,6 +5403,28 @@ time: {}", format_absolute_time(timestamp)));
                 ui.monospace("Space = play/pause");
             });
 
+            let cache_stats = self.frame_cache.stats();
+            let sequence_frame_count = self
+                .active_sequence
+                .as_ref()
+                .map(|sequence| sequence.frames.len())
+                .unwrap_or(0);
+            ui.horizontal_wrapped(|ui| {
+                ui.monospace(format!(
+                    "LZ4 RAM cache: {}/{} frames · {} compressed · {} decoded · {:.2}× · {:.1}% saved · {:.1}% hit",
+                    cache_stats.frames,
+                    sequence_frame_count,
+                    format_memory_bytes(cache_stats.compressed_bytes),
+                    format_memory_bytes(cache_stats.raw_bytes),
+                    cache_stats.compression_ratio(),
+                    cache_stats.savings_percent(),
+                    cache_stats.hit_percent(),
+                ));
+                if cache_stats.frames < sequence_frame_count {
+                    ui.small("warming in background…");
+                }
+            });
+
             if let Some(sequence) = self.active_sequence.as_mut() {
                 let frame_count = sequence.frames.len();
                 if frame_count > 0 {
@@ -4974,7 +5443,11 @@ time: {}", format_absolute_time(timestamp)));
                             frame_count
                         ));
                         ui.separator();
-                        ui.monospace(format!("ABS {absolute}"));
+                        ui.label(
+                            egui::RichText::new(format!("ABS {absolute}"))
+                                .monospace()
+                                .color(status_time_color()),
+                        );
                         ui.separator();
                         ui.monospace(format!("VIDEO {}", format_video_time(relative)));
                     });
@@ -5003,7 +5476,7 @@ time: {}", format_absolute_time(timestamp)));
 
     fn timeseries_controls(&mut self, ui: &mut egui::Ui) {
         ui.collapsing("Timeseries / plot windows", |ui| {
-            ui.small("Every tracked shape area and Home Assistant sensor is a timeseries. Rename it, assign a logical group, and move either one series or a whole group between plot windows.");
+            ui.small("Every tracked shape area, Home Assistant sensor and MQTT pump state is a timeseries. Rename it, assign a logical group, and move either one series or a whole group between plot windows.");
             ui.horizontal_wrapped(|ui| {
                 if ui.button("New plot window").clicked() {
                     self.spawn_plot_window();
@@ -5080,6 +5553,7 @@ time: {}", format_absolute_time(timestamp)));
 
             self.sync_shape_series_metadata();
             self.sync_home_assistant_series_metadata();
+            self.sync_pump_series_metadata();
             let plot_options = self
                 .plot_windows
                 .iter()
@@ -5258,8 +5732,170 @@ time: {}", format_absolute_time(timestamp)));
                 let config = self.ha_series.remove(index);
                 self.ha_data.remove(&config.key);
                 self.series_meta.remove(&config.key);
+                if self.pump_moisture_series_key == config.key {
+                    self.pump_moisture_series_key.clear();
+                    self.pump_last_evaluated_sample = None;
+                    self.pump_last_moisture = None;
+                }
                 self.mark_persistence_dirty();
                 self.save_preferences();
+            }
+        });
+    }
+
+    fn pump_controls(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("MQTT drip pump", |ui| {
+            ui.small("Publishes FORWARD / OFF to the configured MQTT topic. Automatic control evaluates only new Home Assistant moisture samples; enable HA Auto poll above for continuous watering decisions.");
+
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Broker");
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut self.pump_mqtt_host_input).desired_width(180.0))
+                    .changed();
+                ui.label("port");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut self.pump_mqtt_port).range(1..=u16::MAX))
+                    .changed();
+                ui.label("topic");
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut self.pump_mqtt_topic_input).desired_width(220.0))
+                    .changed();
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("MQTT user");
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut self.pump_mqtt_username_input).desired_width(170.0))
+                    .changed();
+                ui.label("password");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.pump_mqtt_password_input)
+                            .password(true)
+                            .desired_width(190.0),
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.pump_mqtt_remember_password, "Remember password")
+                    .changed();
+            });
+
+            ui.separator();
+            let sensor_options = self
+                .ha_series
+                .iter()
+                .map(|config| {
+                    let label = if config.attribute.trim().is_empty() {
+                        config.entity_id.clone()
+                    } else {
+                        format!("{}.{}", config.entity_id, config.attribute)
+                    };
+                    (config.key.clone(), label)
+                })
+                .collect::<Vec<_>>();
+            let selected_sensor = sensor_options
+                .iter()
+                .find(|(key, _)| key == &self.pump_moisture_series_key)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| "Choose Home Assistant moisture sensor".to_owned());
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui.checkbox(&mut self.pump_auto_enabled, "Automatic moisture control").changed();
+                ui.label("Moisture sensor");
+                let old_key = self.pump_moisture_series_key.clone();
+                egui::ComboBox::from_id_salt("pump-moisture-sensor")
+                    .selected_text(selected_sensor)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.pump_moisture_series_key, String::new(), "None");
+                        for (key, label) in &sensor_options {
+                            ui.selectable_value(&mut self.pump_moisture_series_key, key.clone(), label);
+                        }
+                    });
+                if self.pump_moisture_series_key != old_key {
+                    self.pump_last_evaluated_sample = None;
+                    self.pump_last_moisture = None;
+                    changed = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Pump run time");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.pump_run_seconds)
+                            .range(0.1..=86_400.0)
+                            .speed(0.5)
+                            .suffix(" s"),
+                    )
+                    .changed();
+                ui.label("ON below");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.pump_on_threshold)
+                            .range(0.0..=100.0)
+                            .speed(0.5)
+                            .suffix(" %"),
+                    )
+                    .changed();
+                ui.label("OFF at/above");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.pump_off_threshold)
+                            .range(0.0..=100.0)
+                            .speed(0.5)
+                            .suffix(" %"),
+                    )
+                    .changed();
+            });
+            if self.pump_off_threshold <= self.pump_on_threshold {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "OFF threshold must be greater than ON threshold for hysteresis.",
+                );
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                let state_text = if self.pump_is_on { "● ON" } else { "● OFF" };
+                let state_color = if self.pump_is_on {
+                    egui::Color32::LIGHT_GREEN
+                } else {
+                    egui::Color32::LIGHT_RED
+                };
+                ui.colored_label(state_color, state_text);
+                if let Some(value) = self.pump_last_moisture {
+                    ui.monospace(format!("moisture {:.1}%", value));
+                }
+                if let Some(deadline) = self.pump_off_deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now()).as_secs_f32();
+                    ui.monospace(format!("auto OFF in {:.1}s", remaining));
+                }
+                if let Some(command) = self.pump_command_pending {
+                    ui.spinner();
+                    ui.monospace(format!("{} pending", command.label()));
+                }
+            });
+            ui.small(&self.pump_status);
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        self.pump_command_pending.is_none() && !self.pump_off_requested,
+                        egui::Button::new("FORWARD (timed)"),
+                    )
+                    .clicked()
+                {
+                    self.queue_pump_command(PumpCommand::Forward);
+                }
+                if ui.button("OFF").clicked() {
+                    self.pump_off_requested = true;
+                    self.queue_pump_command(PumpCommand::Off);
+                }
+            });
+            ui.small("Pump status is automatically exposed as timeseries 'Pump status': 0 = OFF, 1 = ON. Its name/group/plot can be changed in Timeseries / plot windows.");
+
+            if changed {
+                self.pump_run_seconds = self.pump_run_seconds.clamp(0.1, 86_400.0);
+                self.pump_on_threshold = self.pump_on_threshold.clamp(0.0, 100.0);
+                self.pump_off_threshold = self.pump_off_threshold.clamp(0.0, 100.0);
+                self.mark_persistence_dirty();
             }
         });
     }
@@ -6024,7 +6660,9 @@ impl eframe::App for GreenViewerApp {
         self.poll_yolo_worker(&ctx);
         self.poll_processing_worker(&ctx);
         self.poll_home_assistant_worker();
+        self.poll_mqtt_worker();
         self.tick_home_assistant_poll(&ctx);
+        self.tick_pump_control(&ctx);
         self.tick_continuous_capture(&ctx);
         self.handle_global_shortcuts(&ctx);
         self.tick_sequence_playback(&ctx);
@@ -6064,11 +6702,12 @@ fn source_loop(
     message_tx: mpsc::Sender<SourceMessage>,
     latest_id: Arc<AtomicU64>,
     repaint_ctx: egui::Context,
+    frame_cache: FrameMemoryCache,
 ) {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
-        .user_agent("rust-edge-gui/0.9.0")
+        .user_agent("rust-edge-gui/0.9.2")
         .build()
         .expect("failed to build HTTP client");
 
@@ -6088,7 +6727,8 @@ fn source_loop(
             SourceRequest::SequenceFrame(_) | SourceRequest::CaptureUrl { .. }
         );
         let result = match request {
-            SourceRequest::File(path) | SourceRequest::SequenceFrame(path) => load_file_source(&path),
+            SourceRequest::File(path) => load_file_source(&path),
+            SourceRequest::SequenceFrame(path) => load_sequence_frame_source(&path, &frame_cache),
             SourceRequest::Url(url) => load_url_source(&client, &url),
             SourceRequest::CaptureUrl { url, network, request_timeout } => {
                 (|| -> Result<LoadedImage> {
@@ -6099,7 +6739,7 @@ fn source_loop(
                     let capture_client = reqwest::blocking::Client::builder()
                         .connect_timeout(connect_timeout)
                         .timeout(request_timeout)
-                        .user_agent("rust-edge-gui/0.9.0")
+                        .user_agent("rust-edge-gui/0.9.2")
                         .build()
                         .context("failed to build capture HTTP client")?;
                     network_manager::with_capture_network(network.as_ref(), &url, || {
@@ -6138,6 +6778,28 @@ fn load_file_source(path: &Path) -> Result<LoadedImage> {
         rgba: decoded.to_rgba8(),
         gray: decoded.to_luma8(),
     })
+}
+
+fn load_sequence_frame_source(path: &Path, frame_cache: &FrameMemoryCache) -> Result<LoadedImage> {
+    match frame_cache.get(path) {
+        Ok(Some(decoded)) => {
+            return Ok(LoadedImage {
+                label: path.display().to_string(),
+                rgba: decoded.rgba,
+                gray: decoded.gray,
+            });
+        }
+        Ok(None) => {}
+        Err(_) => {
+            // Corrupt/stale RAM cache must never make a frame unloadable. Drop the
+            // entry and fall back to the authoritative file on disk.
+            frame_cache.remove(path);
+        }
+    }
+
+    let image = load_file_source(path)?;
+    let _ = frame_cache.insert(path.to_path_buf(), &image.rgba, &image.gray);
+    Ok(image)
 }
 
 fn normalize_camera_address(input: &str) -> Result<String> {
@@ -6923,6 +7585,10 @@ fn parse_shape_series_key(key: &str) -> Option<u64> {
     key.strip_prefix("shape:")?.parse().ok()
 }
 
+fn pump_series_key() -> &'static str {
+    "pump:status"
+}
+
 fn ha_series_key(entity_id: &str, attribute: &str) -> String {
     let attribute = attribute.trim();
     if attribute.is_empty() || attribute.eq_ignore_ascii_case("state") {
@@ -7359,6 +8025,31 @@ fn load_image_sequence(root: &Path) -> Result<ImageSequence> {
         frames,
         selected: 0,
     })
+}
+
+fn is_transient_frame_loading_status(text: &str) -> bool {
+    text == "Loading image…"
+        || (text.starts_with("Loaded ") && text.ends_with("; processing…"))
+}
+
+fn status_time_color() -> egui::Color32 {
+    egui::Color32::from_rgb(32, 128, 72)
+}
+
+fn format_memory_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.2} GiB", value / GIB)
+    } else if value >= MIB {
+        format!("{:.1} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.1} KiB", value / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn format_status_time(time: SystemTime) -> String {

@@ -1,3 +1,23 @@
+# v0.9.2
+
+- Add MQTT 3.1.1 QoS1 pump publisher with GUI broker credentials and `FORWARD` / `OFF` control.
+- Add timed pump runs with automatic OFF and fail-safe OFF retries after ambiguous/failed publishes.
+- Add Home Assistant moisture-sensor selection plus ON/OFF hysteresis thresholds in the 0–100 range.
+- Evaluate automatic watering only on newly received HA snapshot samples; HA history backfill never actuates the pump.
+- Add an automatic `Pump status` timeseries (`0 = OFF`, `1 = ON`) integrated with existing rename/group/plot assignment controls.
+- Persist pump status points and their plot metadata with `sequence_state.json`; persist MQTT/automation settings in app state, with password persistence opt-in.
+- Bump package and HTTP user-agent version to 0.9.2.
+
+# v0.9.1
+
+- Add an in-memory LZ4 cache for decoded sequence frames. Cached payloads contain RGBA plus grayscale pixels, so playback avoids repeated PNG/JPEG decoding and disk reads.
+- Warm the whole active sequence in a background prefetch thread; opening another sequence cancels the old prefetch generation. Cache misses still load from disk and immediately populate RAM.
+- Add sequence UI statistics for cached frame count, compressed RAM usage, decoded/raw size, compression ratio, percentage saved, and cache hit rate.
+- Keep live-captured original frames in the same LZ4 RAM cache and remove deleted frames from it safely.
+- Omit transient per-frame `Loading image…` / `Loaded …; processing…` entries from Status History, including old persisted transient entries.
+- Render formatted status/history timestamps and sequence absolute time in dark green.
+- Bump package and HTTP user-agent version to 0.9.1.
+
 # v0.9.0
 
 - Add `Original` and `Processed` visibility toggles to **Timeseries / plot windows**.

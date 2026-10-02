@@ -1,6 +1,35 @@
-# rust-edge-gui 0.9.0
+# rust-edge-gui 0.9.2
 
 Rust/egui plant-mask viewer and timeseries dashboard for top-view cameras. It supports disk images, HTTP camera snapshots, continuous capture, image-sequence history/timeline, native offline YOLO segmentation, temporal filtering, automatic plant/leaf tracking, multiple resizable plots, and external Home Assistant sensor timeseries.
+
+## What changed in 0.9.2
+
+- **MQTT drip-pump control** — configure broker host/port, username, password and topic directly in the GUI. The default topic is `pump/mode/set`; commands are `FORWARD` and `OFF`.
+- **Home Assistant moisture automation** — choose any configured HA numeric sensor as the moisture source. A new sample below the ON threshold starts a timed watering pulse; a sample at/above the OFF threshold sends `OFF`. The gap between thresholds provides hysteresis.
+- **Timed safety OFF** — every successful `FORWARD`, including manual test commands, schedules `OFF` after the configured pump run time. Failed/ambiguous MQTT publishes fail safe toward repeated `OFF` attempts.
+- **QoS 1 MQTT publisher** — the app implements a small MQTT 3.1.1 TCP publisher and waits for PUBACK instead of shelling out to `mosquitto_pub`. No additional MQTT runtime dependency is required.
+- **Pump status timeseries** — `Pump status` is created automatically (`0 = OFF`, `1 = ON`) and uses the same rename/group/plot assignment interface as plant shapes and Home Assistant sensors. Pump status points and plot assignment persist in `sequence_state.json`.
+- **New-sample semantics** — automatic watering decisions are made only once per new HA sample, so an old low-moisture value cannot immediately retrigger watering after the timer expires. Loading HA history does not actuate the pump.
+
+### MQTT pump quick setup
+
+1. Open **MQTT drip pump**.
+2. Set broker host/port (defaults `127.0.0.1:1883`), MQTT username/password and topic (`pump/mode/set`).
+3. Add your FlowerCare moisture sensor under **Home Assistant / FlowerCare timeseries**, then choose that sensor in the pump section.
+4. Set **ON below**, **OFF at/above**, and **Pump run time**. Keep OFF threshold greater than ON threshold.
+5. Enable Home Assistant **Auto poll** and then **Automatic moisture control**.
+6. Use **FORWARD (timed)** / **OFF** to verify the broker/device manually.
+
+The MQTT password is stored in local app state only when **Remember password** is enabled. For physical safety, the pump controller itself should also enforce a hardware/firmware maximum-on watchdog; a desktop application cannot guarantee an OFF command after a host crash or power loss.
+
+## What changed in 0.9.1
+
+- **LZ4 sequence RAM cache** — decoded RGBA + grayscale frame pixels are compressed with LZ4 and retained in memory. Playback hits avoid disk I/O and PNG/JPEG decode work; cache misses fall back to disk and populate the cache automatically.
+- **Background cache warmup** — opening a sequence starts a one-frame-at-a-time background prefetch of all sequence frames. Opening a different sequence cancels the previous warmup generation.
+- **Cache telemetry** — Sequence transport shows cached/total frames, compressed RAM usage, equivalent decoded size, compression ratio, saved percentage and cache hit percentage.
+- **Capture/delete integration** — newly saved original capture frames enter the RAM cache immediately; deleting a frame evicts it and invalidates stale prefetch work.
+- **Cleaner status history** — transient `Loading image…` and `Loaded …; processing…` frame events are no longer stored in Status History.
+- **Dark-green time** — status/history timestamps and the sequence absolute timestamp use a dark-green monospace label.
 
 ## What changed in 0.9.0
 
